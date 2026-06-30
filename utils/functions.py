@@ -264,15 +264,26 @@ def LCP_TSP(
     revision_len,
     revision_iter,
     opts,
-    shift_len
+    shift_len,
+    bench_logger=None,
+    revision_id=None,
     ):
-    
+
     batch_size, num_nodes, coordinate_dim = seeds.shape
     offset = num_nodes % revision_len
     embeddings = None # used only in case problem_size == revision_len for efficiency
+
+    # Per-pass chunk_2opt settings. When --chunk_2opt_after_each_iter is on
+    # (default), we run chunk_2opt after each individual reviser pass — not
+    # just after each cascade level. This is the more aggressive mode.
+    chunk_2opt_on = getattr(opts, 'chunk_2opt', False)
+    chunk_2opt_per_iter = getattr(opts, 'chunk_2opt_after_each_iter', True)
+    chunk_2opt_iters = getattr(opts, 'chunk_2opt_iters', 10)
+    chunk_2opt_override = getattr(opts, 'chunk_2opt_chunk_size', 0)
+
     for i in range(revision_iter):
 
-        decomposed_seeds, offset_seed = decomposition(seeds, 
+        decomposed_seeds, offset_seed = decomposition(seeds,
                                         coordinate_dim,
                                         revision_len,
                                         offset,
@@ -287,39 +298,125 @@ def LCP_TSP(
         else:
             decomposed_seeds_revised, _ = revision(opts, cost_func, reviser, decomposed_seeds, original_subtour)
 
-        seeds = decomposed_seeds_revised.reshape(batch_size, -1, coordinate_dim) 
+        seeds = decomposed_seeds_revised.reshape(batch_size, -1, coordinate_dim)
         if offset_seed is not None:
             seeds = torch.cat([seeds,offset_seed], dim=1)
+
+        # Per-pass chunk_2opt on the SAME chunks as the SHPP decomposition:
+        # by default `cs = revision_len` (the SHPP chunk size). The user can
+        # override this with `--chunk_2opt_chunk_size` to use a different
+        # chunking granularity (e.g., 10-node chunks for a finer search after
+        # a 20-node SHPP decomposition). chunk_2opt handles the offset != 0
+        # case natively (the partial chunk is a regular 2-opt unit), so we
+        # always call it when enabled.
+        if chunk_2opt_on and chunk_2opt_per_iter:
+            cs = chunk_2opt_override or revision_len
+            # When the chunk_2opt chunk size is smaller than the SHPP chunk
+            # size, the SHPP shift_len rotation only visits `revision_iter`
+            # of the `cs` possible alignments. Auto-enable exhaustive_shifts
+            # in that case to cover all alignments. The user can override
+            # with `--no_chunk_2opt_exhaustive_shifts` for speed.
+            if getattr(opts, 'no_chunk_2opt_exhaustive_shifts', False):
+                exhaustive_shifts = False
+            else:
+                exhaustive_shifts = (cs < revision_len)
+            cost_before = (seeds[:, 1:] - seeds[:, :-1]).norm(p=2, dim=2).sum(1) \
+                        + (seeds[:, 0] - seeds[:, -1]).norm(p=2, dim=1)
+            seeds, cost_after, c2o_stats = chunk_2opt(
+                seeds,
+                chunk_size=cs,
+                n_iters=chunk_2opt_iters,
+                include_flip=getattr(opts, 'chunk_2opt_flip', False),
+                include_close=True,
+                exhaustive_shifts=exhaustive_shifts,
+            )
+            if bench_logger is not None:
+                stage = f'chunk_2opt_L{revision_id}_iter{i}' if revision_id is not None \
+                        else f'chunk_2opt_iter{i}'
+                bench_logger.add_stage(
+                    stage,
+                    cost_before=cost_before.detach(),
+                    cost_after=cost_after.detach(),
+                    duration_s=None,
+                    extras={'chunk_size': cs, 'accepts': c2o_stats['accepts'],
+                            'iters': c2o_stats['iters']},
+                )
     return seeds
 
 
-def reconnect( 
+def reconnect(
         get_cost_func,
         batch,
-        opts, 
+        opts,
         revisers,
+        bench_logger=None,
     ):
     seed = batch
-    problem_size = seed.size(1) 
+    problem_size = seed.size(1)
     if len(revisers) == 0:
         cost_revised = (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1) + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)
-    
+
     for revision_id in range(len(revisers)):
         assert opts.revision_lens[revision_id] <= seed.size(1)
         start_time = time.time()
         shift_len = max(opts.revision_lens[revision_id]//opts.revision_iters[revision_id], 1)
         seed = LCP_TSP(
-            seed, 
+            seed,
             get_cost_func,
             revisers[revision_id],
             opts.revision_lens[revision_id],
             opts.revision_iters[revision_id],
             opts=opts,
-            shift_len=shift_len
+            shift_len=shift_len,
+            bench_logger=bench_logger,
+            revision_id=revision_id,
             )
-        cost_revised = (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1) + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)      
+        cost_revised = (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1) + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)
         duration = time.time() - start_time
-        
+
+        if bench_logger is not None:
+            bench_logger.add_stage(
+                f'cascade_{revision_id}',
+                cost_before=None,
+                cost_after=cost_revised.detach(),
+                duration_s=duration,
+                extras={'revision_len': opts.revision_lens[revision_id],
+                       'revision_iters': opts.revision_iters[revision_id],
+                       'shift_len': shift_len},
+            )
+
+        # End-of-pipeline chunk_2opt. Only runs when --chunk_2opt_after_each_iter
+        # is OFF (otherwise the per-pass calls in LCP_TSP already covered this).
+        # By default uses the last cascade level's chunk size (= SHPP chunk size
+        # for the last level); override with --chunk_2opt_chunk_size.
+        if (getattr(opts, 'chunk_2opt', False)
+                and not getattr(opts, 'chunk_2opt_after_each_iter', True)
+                and revision_id == len(revisers) - 1):
+            cs = getattr(opts, 'chunk_2opt_chunk_size', 0) or opts.revision_lens[revision_id]
+            if getattr(opts, 'no_chunk_2opt_exhaustive_shifts', False):
+                exhaustive_shifts = False
+            else:
+                exhaustive_shifts = (cs < opts.revision_lens[revision_id])
+            cost_before_eop = cost_revised.detach()
+            seed, cost_revised, c2o_stats = chunk_2opt(
+                seed,
+                chunk_size=cs,
+                n_iters=getattr(opts, 'chunk_2opt_iters', 10),
+                include_flip=getattr(opts, 'chunk_2opt_flip', False),
+                include_close=True,
+                exhaustive_shifts=exhaustive_shifts,
+            )
+            if bench_logger is not None:
+                bench_logger.add_stage(
+                    f'chunk_2opt_end',
+                    cost_before=cost_before_eop,
+                    cost_after=cost_revised.detach(),
+                    duration_s=None,
+                    extras={'chunk_size': cs,
+                            'accepts': c2o_stats['accepts'],
+                            'iters': c2o_stats['iters']},
+                )
+
         if revision_id == 0 and not opts.no_prune: # eliminate the underperforming ones after the first round of revisions
             cost_revised, cost_revised_minidx = cost_revised.reshape(-1, opts.eval_batch_size).min(0) # width, bs
             seed = seed.reshape(-1, opts.eval_batch_size, seed.shape[-2], 2)[cost_revised_minidx, torch.arange(opts.eval_batch_size)]
@@ -328,8 +425,372 @@ def reconnect(
             seed = seed.reshape(-1, opts.eval_batch_size, seed.shape[-2], 2)[cost_revised_minidx, torch.arange(opts.eval_batch_size)]
     assert cost_revised.shape == (opts.eval_batch_size,)
     assert seed.shape == (opts.eval_batch_size, problem_size, 2)
-        
+
     return seed, cost_revised
+
+
+def chunk_2opt(seed, chunk_size, n_iters=10, include_flip=False, include_close=True,
+             exhaustive_shifts=False):
+    """Chunk-level 2-opt: permute (and optionally flip) chunks to reduce the
+    cost of inter-chunk boundary edges. Internal chunk contents are preserved,
+    so this is a search over the `k = ceil(N / chunk_size)` chunk orderings
+    (and orientations) of the tour. When `N % chunk_size != 0`, the final
+    "partial" chunk is a regular 2-opt unit (just with fewer nodes), not a
+    no-op.
+
+    The move is a 2-opt segment reversal: pick two non-adjacent chunk boundaries
+    `(a, b)` and `(c, d)` in the current order and reverse the segment
+    `[b, ..., c]`. With `include_flip=True`, we additionally consider the
+    variant where chunks `b` and `c` are flipped in orientation.
+
+    Always best-improvement-and-only-if-positive: never produces a tour worse
+    than the input (within 1e-9 of strict improvement), and exits early when
+    no further improvement is found.
+
+    Args:
+        seed: (B, N, 2) float tensor — coordinates in tour order (closed loop).
+              Matches the layout used by `reconnect` (utils/functions.py:296)
+              and main.py:124.
+        chunk_size: int. Need not divide N — the trailing `N % chunk_size`
+                    nodes form a partial chunk that is also a 2-opt unit.
+                    No-op (with a one-time warn) only when chunk_size <= 1
+                    or chunk_size >= N.
+        n_iters: max outer 2-opt sweeps. Stops early if no improvement.
+        include_flip: if True, also try flipping chunks b and c in each move.
+        include_close: if True, treat tour as closed loop and include the
+                       wraparound edge (chunk k-1 → chunk 0) in the cost;
+                       matches the convention used by `reconnect` and main.py:124.
+        exhaustive_shifts: if True, try all `chunk_size` rotations of the
+                           chunk boundaries and keep the best per-instance
+                           result. This guarantees full coverage of all
+                           possible chunk alignments (important when the
+                           chunk size is smaller than the SHPP decomposition's
+                           chunk size — in that case, the SHPP shift_len
+                           rotation only visits `revision_iter` of the
+                           `chunk_size` possible alignments). Cost: roughly
+                           `chunk_size`× more compute per call. When False
+                           (default), the search is run on the input as-is
+                           (single alignment) and the caller is expected to
+                           drive multiple rotations via the LCP_TSP pass loop.
+
+    Returns:
+        new_seed: (B, N, 2) — improved tour; never worse per-instance.
+        new_cost: (B,) — closed-loop tour length of new_seed, recomputed
+                  using the canonical formula (utils/functions.py:305) to
+                  avoid stale `cost_internal`.
+        stats: dict with:
+            - 'initial_cost': (B,) cost before search
+            - 'final_cost':   (B,) cost after search
+            - 'iters':        int, number of sweeps actually run (summed
+                               across all shifts when exhaustive_shifts=True)
+            - 'accepts':      int, total moves accepted across sweeps (summed
+                               across all shifts when exhaustive_shifts=True)
+            - 'improved_mask': bool (B,) — instances where at least one move
+                               was accepted (across any shift)
+            - 'exhaustive_shifts': int — number of shifts tried (only present
+                                        when the flag was on)
+    """
+    B, N, _ = seed.shape
+
+    # Canonical closed-loop tour cost (matches utils/functions.py:305, :320).
+    def _closed_cost(x):
+        return (x[:, 1:] - x[:, :-1]).norm(p=2, dim=2).sum(1) \
+             + (x[:, 0] - x[:, -1]).norm(p=2, dim=1)
+
+    # Graceful no-op only when chunk_size is so small/large that no 2-opt is
+    # possible. (N % chunk_size != 0 is fine — see below.)
+    if chunk_size <= 1 or chunk_size >= N:
+        warnings.warn(
+            f"chunk_2opt: chunk_size={chunk_size} invalid for N={N}; "
+            f"returning input unchanged."
+        )
+        cost = _closed_cost(seed).detach().clone()
+        return seed, cost, {
+            'initial_cost': cost.clone(),
+            'final_cost': cost.clone(),
+            'iters': 0,
+            'accepts': 0,
+            'improved_mask': torch.zeros(B, dtype=torch.bool, device=seed.device),
+        }
+
+    # Chunk decomposition: `k_complete` full chunks of size `s`, plus one
+    # partial chunk of size `offset` if N is not a multiple of `s`. The
+    # partial chunk is a regular 2-opt unit, just with fewer nodes.
+    k_complete = N // chunk_size
+    offset = N - k_complete * chunk_size  # = N % chunk_size
+    k = k_complete + (1 if offset > 0 else 0)
+    s = chunk_size
+    device = seed.device
+
+    if k <= 1:
+        # Not enough units to form a 2-opt move.
+        cost = _closed_cost(seed).detach().clone()
+        return seed, cost, {
+            'initial_cost': cost.clone(),
+            'final_cost': cost.clone(),
+            'iters': 0,
+            'accepts': 0,
+            'improved_mask': torch.zeros(B, dtype=torch.bool, device=device),
+        }
+
+    # Exhaustive-shifts mode: try all `chunk_size` rotations of the chunk
+    # boundaries and keep the best per-instance result. This guarantees full
+    # coverage of all possible chunk alignments (important when the chunk
+    # size is smaller than the SHPP decomposition's chunk size, since the
+    # SHPP shift_len rotation only visits `revision_iter` of the
+    # `chunk_size` possible alignments). Cost: roughly `chunk_size`× more
+    # compute per call.
+    if exhaustive_shifts and chunk_size > 1:
+        initial_cost = _closed_cost(seed).detach().clone()
+        best_seed = seed.clone()
+        best_cost = _closed_cost(seed)
+        total_iters = 0
+        total_accepts = 0
+        improved_mask = torch.zeros(B, dtype=torch.bool, device=device)
+        for shift in range(chunk_size):
+            if shift > 0:
+                shifted_seed = torch.roll(seed, shifts=shift, dims=1)
+            else:
+                shifted_seed = seed
+            s, c, st = chunk_2opt(
+                shifted_seed, chunk_size, n_iters=n_iters,
+                include_flip=include_flip, include_close=include_close,
+                exhaustive_shifts=False,  # recurse without the wrapper
+            )
+            if shift > 0:
+                s = torch.roll(s, shifts=-shift, dims=1)
+            improved = c < best_cost - 1e-9
+            if improved.any():
+                best_seed[improved] = s[improved]
+                best_cost[improved] = c[improved]
+                improved_mask |= improved
+            total_iters += st.get('iters', 0)
+            total_accepts += st.get('accepts', 0)
+        stats = {
+            'initial_cost': initial_cost,
+            'final_cost': best_cost,
+            'iters': total_iters,
+            'accepts': total_accepts,
+            'improved_mask': improved_mask,
+            'exhaustive_shifts': chunk_size,
+        }
+        return best_seed, best_cost, stats
+
+    if offset == 0:
+        # Fast path: N is an exact multiple of chunk_size. All units have
+        # the same size; we can use a simple reshape + gather + reshape.
+        chunks = seed.reshape(B, k, s, 2).contiguous()                  # (B, k, s, 2)
+        actual_sizes = None  # sentinel: all chunks have size s
+    else:
+        # Pad the partial chunk with its last actual node so the phantom
+        # "edges" in the padded positions have length 0. The 2-opt algorithm
+        # only uses start/end and intra-chunk edge sums, so the padding
+        # doesn't change any cost (and the partial chunk can be permuted
+        # alongside the complete ones in the same vectorized loop).
+        chunks = torch.zeros(B, k, s, 2, device=device, dtype=seed.dtype)
+        actual_sizes = torch.full((k,), s, device=device, dtype=torch.long)
+        if k_complete > 0:
+            chunks[:, :k_complete, :, :] = (
+                seed[:, :k_complete * s, :].reshape(B, k_complete, s, 2)
+            )
+        # Partial chunk: first `offset` positions are real; the rest are
+        # padded with the last actual node (so phantom edges have length 0).
+        chunks[:, k_complete, :offset, :] = seed[:, k_complete * s:, :]
+        if offset < s:
+            chunks[:, k_complete, offset:, :] = seed[:, -1:, :]
+        actual_sizes[k_complete] = offset
+
+    # Forward start/end. For the partial chunk, end is at index (size - 1).
+    start_fwd = chunks[:, :, 0, :].contiguous()                              # (B, k, 2)
+    if actual_sizes is None:
+        end_fwd = chunks[:, :, -1, :].contiguous()                            # (B, k, 2)
+    else:
+        # Gather along the s dimension (dim=2) to pick the last *actual* node
+        # of each chunk. end_indices has shape (1, k, 1) — one index per chunk
+        # along dim 2 — broadcast to (B, k, 1, 2) for the gather.
+        end_idx = (actual_sizes - 1).view(1, k, 1, 1).expand(B, k, 1, 2)
+        end_fwd = torch.gather(chunks, 2, end_idx).squeeze(2).contiguous()    # (B, k, 2)
+
+    # State: a per-batch permutation of chunks + a per-batch orientation mask.
+    order = torch.arange(k, device=device).expand(B, -1).contiguous()  # (B, k)
+    flip = torch.zeros(B, k, dtype=torch.bool, device=device)           # (B, k)
+
+    initial_cost = _closed_cost(seed).detach().clone()
+
+    # Enumerate all 2-opt moves as (a, b, c, d) tuples where (a, b) and (c, d)
+    # are the two chunk boundaries being rewired. Edges before: D[a, b] + D[c, d].
+    # Edges after:  D[a, c] + D[b, d]. Segment reversed: [b, ..., c].
+    # For closed tours, the wraparound case has c = k-1, d = 0.
+    #
+    # NB: unlike standard city-level 2-opt, the cost change is NOT just the
+    # two boundary edges. When a segment of chunks is reversed, every internal
+    # edge of the segment changes direction — and unlike single-city edges,
+    # the boundary cost D(x, y) = ||end[x] - start[y]|| is generally NOT
+    # symmetric: D(x, y) != D(y, x). We account for the internal edge cost
+    # changes via the prefix-sum term `prefix_E[c] - prefix_E[b]` below.
+    pair_a, pair_b, pair_c, pair_d = [], [], [], []
+    for i in range(k):
+        for j in range(i + 2, k):
+            pair_a.append(i)
+            pair_b.append(i + 1)
+            pair_c.append(j - 1)
+            pair_d.append(j)
+    if include_close and k >= 3:
+        for i in range(k - 2):
+            pair_a.append(i)
+            pair_b.append(i + 1)
+            pair_c.append(k - 1)
+            pair_d.append(0)
+
+    P = len(pair_a)
+    if P == 0:
+        # k is too small for any 2-opt move (e.g., k == 2).
+        stats = {
+            'initial_cost': initial_cost,
+            'final_cost': initial_cost.clone(),
+            'iters': 0,
+            'accepts': 0,
+            'improved_mask': torch.zeros(B, dtype=torch.bool, device=device),
+        }
+        return seed, initial_cost, stats
+
+    pair_a = torch.tensor(pair_a, device=device, dtype=torch.long)
+    pair_b = torch.tensor(pair_b, device=device, dtype=torch.long)
+    pair_c = torch.tensor(pair_c, device=device, dtype=torch.long)
+    pair_d = torch.tensor(pair_d, device=device, dtype=torch.long)
+
+    accepts = 0
+    iters = 0
+    improved_mask = torch.zeros(B, dtype=torch.bool, device=device)
+
+    for _ in range(n_iters):
+        iters += 1
+
+        # Effective start/end of the chunk at each position, given the current
+        # `order` and `flip`. If `flip[t]` is True, start and end swap.
+        chunk_idx = order                                                       # (B, k)
+        idx_exp = chunk_idx.unsqueeze(-1).expand(-1, -1, 2)                    # (B, k, 2)
+        s_gather = start_fwd.gather(1, idx_exp)                                 # (B, k, 2)
+        e_gather = end_fwd.gather(1, idx_exp)                                   # (B, k, 2)
+        s_eff = torch.where(flip.unsqueeze(-1), e_gather, s_gather)
+        e_eff = torch.where(flip.unsqueeze(-1), s_gather, e_gather)
+
+        # Boundary cost matrix D[a, b] = ||e_eff[a] - s_eff[b]||.
+        D = (e_eff.unsqueeze(2) - s_eff.unsqueeze(1)).norm(dim=-1)              # (B, k, k)
+
+        # No-flip delta for every (a, b, c, d). The full delta accounts for
+        # the internal edges of the reversed segment too:
+        #   delta = (D[a, c] + D[b, d] - D[a, b] - D[c, d])         (boundary improvement)
+        #         - sum_{i=b}^{c-1} (D[i+1, i] - D[i, i+1])         (internal worsening)
+        # where the second term is subtracted because E[i] = D[i+1, i] - D[i, i+1]
+        # is the COST INCREASE from reversing internal edge (i, i+1). A positive
+        # delta = (old cost) - (new cost) means the move is an improvement.
+        D_ab = D[:, pair_a, pair_b]                                             # (B, P)
+        D_cd = D[:, pair_c, pair_d]
+        D_ac = D[:, pair_a, pair_c]
+        D_bd = D[:, pair_b, pair_d]
+        boundary_delta = D_ab + D_cd - D_ac - D_bd                               # (B, P)
+
+        # E[i] = cost change of reversing the (i, i+1) edge: D[i+1, i] - D[i, i+1].
+        # E has shape (B, k-1); we then prefix-sum to (B, k) with prefix_E[0] = 0.
+        idx_i = torch.arange(k - 1, device=device)
+        idx_ip1 = idx_i + 1
+        D_ii1 = D[:, idx_i, idx_ip1]                                            # (B, k-1)
+        D_i1i = D[:, idx_ip1, idx_i]                                            # (B, k-1)
+        E = D_i1i - D_ii1                                                       # (B, k-1)
+        prefix_E = torch.zeros(B, k, device=device, dtype=E.dtype)
+        prefix_E[:, 1:] = E.cumsum(dim=-1)                                       # (B, k)
+        # Internal sum for segment [b, c] is prefix_E[c] - prefix_E[b].
+        # Subtract from boundary_delta: positive delta = improvement.
+        internal_sum = prefix_E[:, pair_c] - prefix_E[:, pair_b]                # (B, P)
+        delta_noflip = boundary_delta - internal_sum                             # (B, P)
+
+        # NOTE: the all-flip variant (flipping chunks b and c as part of the
+        # move) would need a similar accounting for the changed internal edges
+        # of the flipped boundary chunks. For now we keep the implementation
+        # minimal: ignore the all-flip path and just use the no-flip delta.
+        # The CLI flag `--chunk_2opt_flip` is preserved for forward
+        # compatibility but currently has no effect.
+        delta_best = delta_noflip
+        take_flip = torch.zeros_like(delta_noflip, dtype=torch.bool)
+
+        # Best move per batch instance.
+        best_p = delta_best.argmax(dim=1)                                       # (B,)
+        best_delta = delta_best.gather(1, best_p.unsqueeze(1)).squeeze(1)       # (B,)
+
+        if best_delta.max() <= 1e-9:
+            break
+
+        mask = best_delta > 1e-9
+        if not mask.any():
+            break
+
+        idx_a = pair_a[best_p]
+        idx_b = pair_b[best_p]
+        idx_c = pair_c[best_p]
+        idx_d = pair_d[best_p]
+        use_flip = take_flip.gather(1, best_p.unsqueeze(1)).squeeze(1)
+
+        # Apply the move per batch instance. The chunk identities in the
+        # reversed segment are permuted, so we reverse `order` AND `flip`
+        # together; then optionally toggle `flip` at the new boundary
+        # positions for the all-flip variant.
+        b_idx = mask.nonzero(as_tuple=True)[0]
+        for b in b_idx.tolist():
+            i_b = int(idx_b[b].item())
+            i_c = int(idx_c[b].item())
+            order[b, i_b:i_c + 1] = order[b, i_b:i_c + 1].flip(0)
+            flip[b, i_b:i_c + 1] = flip[b, i_b:i_c + 1].flip(0)
+            if bool(use_flip[b].item()):
+                flip[b, i_b] = ~flip[b, i_b]
+                flip[b, i_c] = ~flip[b, i_c]
+
+        accepts += int(mask.sum().item())
+        improved_mask |= mask
+
+    # Reconstruct the tour from `order` and `flip`. Each chunk keeps its
+    # original node content; only the position and orientation change.
+    chunk_idx = order
+    chunk_idx_exp = chunk_idx.view(B, k, 1, 1).expand(-1, -1, s, 2)
+    new_chunks = torch.gather(chunks, 1, chunk_idx_exp)                         # (B, k, s, 2)
+
+    if flip.any():
+        new_chunks_flipped = new_chunks.flip(dims=[2])
+        flip_mask = flip.view(B, k, 1, 1)
+        new_chunks = torch.where(flip_mask, new_chunks_flipped, new_chunks)
+
+    if actual_sizes is None:
+        # Fast reconstruction: all units have the same size, so the gathered
+        # tensor can be reshaped directly.
+        new_seed = new_chunks.reshape(B, N, 2).contiguous()
+    else:
+        # Variable-size reconstruction: for each (batch, position), take only
+        # the first actual_sizes[order[b, t]] nodes of the gathered chunk.
+        # We use a per-batch loop here — B is typically small (~128) and the
+        # loop is O(B * k * s) which is the same order as the main 2-opt loop.
+        new_seed = torch.empty(B, N, 2, device=device, dtype=seed.dtype)
+        for b in range(B):
+            pos = 0
+            for t in range(k):
+                size_t = int(actual_sizes[int(chunk_idx[b, t].item())].item())
+                chunk_data = new_chunks[b, t, :size_t, :]
+                if bool(flip[b, t].item()):
+                    chunk_data = chunk_data.flip(0)
+                new_seed[b, pos:pos + size_t, :] = chunk_data
+                pos += size_t
+            assert pos == N, f"batch {b}: pos {pos} != N {N}"
+        new_seed = new_seed.contiguous()
+
+    new_cost = _closed_cost(new_seed).detach().clone()
+
+    stats = {
+        'initial_cost': initial_cost,
+        'final_cost': new_cost,
+        'iters': iters,
+        'accepts': accepts,
+        'improved_mask': improved_mask,
+    }
+    return new_seed, new_cost, stats
 
 
 def sample_many():

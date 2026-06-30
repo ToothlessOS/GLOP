@@ -10,6 +10,7 @@ from utils.functions import reconnect
 from utils.functions import load_problem
 import pprint as pp
 from utils.insertion import random_insertion_parallel
+from utils.bench_utils import BenchLogger
 
 torch.manual_seed(1)
 
@@ -27,17 +28,28 @@ def eval_dataset(dataset_path, opts):
 
     for reviser_size in revision_lens:
         reviser_path = f'pretrained/Reviser-stage2/reviser_{reviser_size}/epoch-299.pt'
-        
+
         reviser, _ = load_model(reviser_path, is_local=True)
         revisers.append(reviser)
-        
+
     for reviser in revisers:
         reviser.to(device)
         reviser.eval()
         reviser.set_decode_type(opts.decode_strategy)
 
+    bench_logger = BenchLogger(
+        results_dir=getattr(opts, 'results_dir', '') or '',
+        save_json=getattr(opts, 'save_json', False),
+        tag=f"tsplib_{opts.path.split('/')[-1].replace('.pkl','')}",
+    )
+
     dataset = reviser.problem.make_dataset(filename=dataset_path, num_samples=opts.val_size, offset=0)
-    results, duration = _eval_dataset(dataset, opts, device, revisers)
+    results, duration = _eval_dataset(dataset, opts, device, revisers,
+                                       bench_logger=bench_logger)
+
+    if bench_logger is not None:
+        bench_logger.print_summary()
+        bench_logger.close()
 
     costs, costs_revised, tours = zip(*results)  # Not really costs since they should be negative
     
@@ -49,7 +61,7 @@ def eval_dataset(dataset_path, opts):
     print("Average cost_revised: {} +- {}".format(costs_revised.mean().item(), (2 * torch.std(costs_revised) / math.sqrt(len(costs_revised))).item()))
     print("Total duration: {}".format(duration))
 
-def _eval_dataset(dataset, opts, device, revisers):
+def _eval_dataset(dataset, opts, device, revisers, bench_logger=None):
 
     dataloader = DataLoader(dataset, batch_size=opts.eval_batch_size)
     problem = load_problem(opts.problem_type)
@@ -122,11 +134,12 @@ def _eval_dataset(dataset, opts, device, revisers):
                 opts.revision_iters = [10,10,5] # 4,2,1
 
             start = time.time()
-            tours, costs_revised = reconnect( 
+            tours, costs_revised = reconnect(
                                         get_cost_func=get_cost_func,
                                         batch=seed,
                                         opts=opts,
                                         revisers=_revisers,
+                                        bench_logger=bench_logger,
                                         )
             total_time += time.time() - start
             # tours shape: problem_size, 2
@@ -138,6 +151,14 @@ def _eval_dataset(dataset, opts, device, revisers):
             results.append((avg_cost, costs_revised, tours))
         else:
             results.append((avg_cost, None, tours))
+
+        if bench_logger is not None and costs_revised is not None:
+            bench_logger.add_instance(
+                instance_id=batch_id,
+                cost_before=avg_cost,
+                cost_after=float(costs_revised.item()),
+                breakdown={},
+            )
 
     return results, total_time
 
@@ -165,6 +186,26 @@ if __name__ == "__main__":
     parser.add_argument('--path', type=str, default='', 
                         help='The test dataset path for cross-distribution evaluation')
     parser.add_argument('--no_prune', action='store_true', help='Do not prune the unpromising tours after the first round of revisions')
+    # --- chunk-level 2-opt + benchmarking (see docs/LOCAL_CONSTRUCTION.md §11) ---
+    parser.add_argument('--chunk_2opt', action='store_true', default=False,
+                        help='Enable chunk-level 2-opt search.')
+    parser.add_argument('--chunk_2opt_after_each_iter', action='store_true', default=True,
+                        help='Run chunk-2-opt after every individual reviser pass (the '
+                             'aggressive mode). If False, run only at the end of the pipeline.')
+    parser.add_argument('--chunk_2opt_flip', action='store_true', default=False,
+                        help='Also try flipping chunk orientations (currently a no-op).')
+    parser.add_argument('--chunk_2opt_iters', type=int, default=10,
+                        help='Max outer iterations of the chunk-2-opt sweep.')
+    parser.add_argument('--chunk_2opt_chunk_size', type=int, default=0,
+                        help='If >0, override per-level chunk size.')
+    parser.add_argument('--no_chunk_2opt_exhaustive_shifts', action='store_true', default=False,
+                        help='Disable exhaustive rotation search in chunk_2opt. By default, '
+                             'when --chunk_2opt_chunk_size < revision_len, all rotations of '
+                             'the chunk boundaries are tried to guarantee full coverage.')
+    parser.add_argument('--results_dir', type=str, default='',
+                        help='Where to write JSON outputs (empty = disabled).')
+    parser.add_argument('--save_json', action='store_true', default=False,
+                        help='Dump BenchLogger state to JSON at end of run.')
     opts = parser.parse_args()
     if opts.path == '':
         dataset_path = f'data/tsp/tsp{opts.problem_size}_test.pkl'

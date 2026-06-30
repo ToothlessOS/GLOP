@@ -13,6 +13,7 @@ import pprint as pp
 from utils.insertion import random_insertion_parallel
 from heatmap.cvrp.infer import load_partitioner
 from heatmap.cvrp.inst import sum_cost
+from utils.bench_utils import BenchLogger
 
 
 def eval_dataset(dataset_path, opts):
@@ -30,8 +31,19 @@ def eval_dataset(dataset_path, opts):
         reviser.to(opts.device)
         reviser.eval()
         reviser.set_decode_type(opts.decode_strategy)
-        
-    results, duration = _eval_dataset(dataset_path, opts, opts.device, revisers)
+
+    bench_logger = BenchLogger(
+        results_dir=getattr(opts, 'results_dir', '') or '',
+        save_json=getattr(opts, 'save_json', False),
+        tag=f"{opts.problem_type}{opts.problem_size}",
+    )
+
+    results, duration = _eval_dataset(dataset_path, opts, opts.device, revisers,
+                                       bench_logger=bench_logger)
+
+    if bench_logger is not None:
+        bench_logger.print_summary()
+        bench_logger.close()
 
     costs, costs_revised, costs_revised_with_penalty, tours = zip(*results)
     costs = torch.tensor(costs)
@@ -55,10 +67,11 @@ def eval_dataset(dataset_path, opts):
         tours = torch.cat(tours, dim=0)
     return tours
 
-def _eval_dataset(dataset_path, opts, device, revisers):
+def _eval_dataset(dataset_path, opts, device, revisers, bench_logger=None):
     start = time.time()
     if opts.problem_type == 'tsp':
         dataset = revisers[0].problem.make_dataset(filename=dataset_path, num_samples=opts.val_size, offset=0)
+        dataset = torch.stack(dataset.data, dim=0)  # (val_size, problem_size, 2)
         if opts.problem_size <= 100:
             if opts.width >= 4:
                 opts.width //= 4
@@ -136,11 +149,12 @@ def _eval_dataset(dataset_path, opts, device, revisers):
                 seed4 = torch.cat((1 - seed[:, :, [0]], 1 - seed[:, :, [1]]), dim=2)
                 seed = torch.cat((seed, seed2, seed3, seed4), dim=0)
                 
-            tours, costs_revised = reconnect( 
+            tours, costs_revised = reconnect(
                                         get_cost_func=get_cost_func,
                                         batch=seed,
                                         opts=opts,
                                         revisers=revisers,
+                                        bench_logger=bench_logger,
                                         )
 
         if opts.problem_type == 'pctsp':
@@ -163,6 +177,20 @@ def _eval_dataset(dataset_path, opts, device, revisers):
             results.append((avg_cost, costs_revised, None, tours))
         else:
             raise NotImplementedError
+
+        # Per-instance logging for the benchmarker. We log one entry per
+        # instance in the batch, recording the pre-revision cost (the
+        # min-over-width per instance) and the post-revision cost.
+        if bench_logger is not None and opts.problem_type in ['tsp', 'pctsp']:
+            bs = costs_revised.shape[0]
+            for i in range(bs):
+                global_id = batch_id * bs + i
+                bench_logger.add_instance(
+                    instance_id=global_id,
+                    cost_before=float(cost_ori[i].item()),
+                    cost_after=float(costs_revised[i].item()),
+                    breakdown={},
+                )
         
 
     duration = time.time() - start
@@ -196,6 +224,26 @@ if __name__ == "__main__":
     parser.add_argument('--n_partition', type=int, default=1, help='The number of stochastically constructed CVRP partitions')
     parser.add_argument('--ckpt_path', type=str, default='', help='Checkpoint path for CVRP eval')
     parser.add_argument('--no_prune', action='store_true', help='Do not prune the unpromising tours after the first round of revisions')
+    # --- chunk-level 2-opt + benchmarking (see docs/LOCAL_CONSTRUCTION.md §11) ---
+    parser.add_argument('--chunk_2opt', action='store_true', default=False,
+                        help='Enable chunk-level 2-opt search.')
+    parser.add_argument('--chunk_2opt_after_each_iter', action='store_true', default=True,
+                        help='Run chunk-2-opt after every individual reviser pass (the '
+                             'aggressive mode). If False, run only at the end of the pipeline.')
+    parser.add_argument('--chunk_2opt_flip', action='store_true', default=False,
+                        help='Also try flipping chunk orientations (currently a no-op, kept for API stability).')
+    parser.add_argument('--chunk_2opt_iters', type=int, default=10,
+                        help='Max outer iterations of the chunk-2-opt sweep.')
+    parser.add_argument('--chunk_2opt_chunk_size', type=int, default=0,
+                        help='If >0, override per-level chunk size with this fixed value.')
+    parser.add_argument('--no_chunk_2opt_exhaustive_shifts', action='store_true', default=False,
+                        help='Disable exhaustive rotation search in chunk_2opt. By default, '
+                             'when --chunk_2opt_chunk_size < revision_len, all rotations of '
+                             'the chunk boundaries are tried to guarantee full coverage.')
+    parser.add_argument('--results_dir', type=str, default='',
+                        help='Where to write JSON outputs (empty = disabled).')
+    parser.add_argument('--save_json', action='store_true', default=False,
+                        help='Dump BenchLogger state to JSON at end of run.')
     opts = parser.parse_args()
 
     use_cuda = torch.cuda.is_available() and not opts.no_cuda

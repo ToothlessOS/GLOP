@@ -1,0 +1,30 @@
+[project]
+name = "glop"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.10.*"
+dependencies = [
+    "numpy==1.23.*",
+    "random-insertion>=0.3.0",
+    "scipy>=1.15.3",
+    "setuptools==69.5.1",
+    "torch==1.13.0",
+    "torch-geometric==2.0.4",
+    "torch-scatter==2.0.7",
+    "torch-sparse==0.6.9",
+    "tqdm>=4.66.5",
+]
+
+[tool.uv.extra-build-dependencies]
+torch-scatter = ["torch"]
+torch-sparse = ["torch"]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu117"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.15.20",
+]
