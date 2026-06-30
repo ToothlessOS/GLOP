@@ -196,6 +196,10 @@ if __name__ == "__main__":
     parser.add_argument('--n_partition', type=int, default=1, help='The number of stochastically constructed CVRP partitions')
     parser.add_argument('--ckpt_path', type=str, default='', help='Checkpoint path for CVRP eval')
     parser.add_argument('--no_prune', action='store_true', help='Do not prune the unpromising tours after the first round of revisions')
+    parser.add_argument('--use_connection_revision', action='store_true',
+                        help='After every chunk-revision iteration, run a '
+                             'connection-revision pass on the boundaries '
+                             'between adjacent sub-tours.')
     opts = parser.parse_args()
 
     use_cuda = torch.cuda.is_available() and not opts.no_cuda

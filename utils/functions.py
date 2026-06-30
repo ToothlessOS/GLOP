@@ -287,10 +287,88 @@ def LCP_TSP(
         else:
             decomposed_seeds_revised, _ = revision(opts, cost_func, reviser, decomposed_seeds, original_subtour)
 
-        seeds = decomposed_seeds_revised.reshape(batch_size, -1, coordinate_dim) 
+        seeds = decomposed_seeds_revised.reshape(batch_size, -1, coordinate_dim)
         if offset_seed is not None:
             seeds = torch.cat([seeds,offset_seed], dim=1)
+        # NEW: connection-revision pass — separately optimize the boundaries
+        # between adjacent sub-tours that were just stitched back together.
+        if getattr(opts, 'use_connection_revision', False):
+            seeds = connection_revision(opts, cost_func, reviser, seeds,
+                                        revision_len, shift_len)
     return seeds
+
+
+def connection_revision(opts, cost_func, reviser, seeds, revision_len, shift_len):
+    """
+    Run a connection-revision pass on the stitched tour ``seeds``.
+
+    For each connection edge between two adjacent sub-tours (boundaries at
+    multiples of ``revision_len`` in the rolled sequence), extract a window of
+    size ``revision_len`` centered on the connection, run the reviser on it,
+    and graft the result back. If the full closed-tour cost does not improve,
+    revert to the original ``seeds``.
+
+    Args:
+        opts: argparse Namespace (used for opts.no_aug, etc.).
+        cost_func: callable (input, pi) -> cost. Forwarded to ``revision``.
+        reviser: the neural reviser model.
+        seeds: (B, N, 2) full tour in the original (un-rolled) order.
+        revision_len: L, the chunk size used by the previous LCP_TSP step.
+        shift_len: rolling shift used by LCP_TSP (so we can locate connections).
+
+    Returns:
+        (B, N, 2) seeds, either unchanged or with all windows revised.
+    """
+    B, N, _ = seeds.shape
+    device = seeds.device
+
+    # Need at least two chunks to form a connection.
+    K = N // revision_len
+    if K < 2:
+        return seeds
+
+    # Save the original (un-rolled) tour in case we need to revert.
+    original_seeds = seeds.clone()
+
+    # Roll by shift_len so chunk boundaries fall at multiples of L.
+    rolled = torch.cat([seeds[:, shift_len:], seeds[:, :shift_len]], dim=1)
+
+    # Build (K, L) indices: for each connection at center j*L,
+    # the window covers positions (j*L - half) .. (j*L - half + L - 1),
+    # with modular indexing so the wraparound connection is handled.
+    half = revision_len // 2
+    centers = torch.arange(K, device=device) * revision_len            # (K,)
+    offsets = torch.arange(revision_len, device=device) - half          # (L,)
+    indices = (centers.unsqueeze(1) + offsets.unsqueeze(0)) % N         # (K, L)
+
+    # Gather windows: (B, K, L, 2).
+    windows = rolled[:, indices, :]
+
+    # Flatten and call the existing revision() — it inherits augmentation,
+    # embedding reuse logic, and per-chunk fallback for cost regressions.
+    windows_flat = windows.reshape(B * K, revision_len, 2)
+    original_subtour = torch.arange(revision_len, device=device, dtype=torch.long)
+    revised_flat, _ = revision(opts, cost_func, reviser, windows_flat, original_subtour)
+    revised = revised_flat.view(B, K, revision_len, 2)
+
+    # Vectorized writeback of all windows into the rolled tour.
+    indices_flat = indices.reshape(-1)                                  # (K*L,)
+    rolled[:, indices_flat, :] = revised.view(B, K * revision_len, 2)
+
+    # Unroll back to the original order.
+    new_seeds = torch.cat([rolled[:, -shift_len:], rolled[:, :-shift_len]], dim=1)
+
+    # Global closed-tour cost gate: accept the revision only if it improves
+    # the full tour cost. This accounts for boundary edges into/out of each
+    # window that change because the first/last nodes of the window change.
+    def full_cost(t):
+        return (t[:, 1:] - t[:, :-1]).norm(p=2, dim=2).sum(1) \
+             + (t[:, 0] - t[:, -1]).norm(p=2, dim=1)
+
+    cost_before = full_cost(original_seeds)
+    cost_after = full_cost(new_seeds)
+    improved = (cost_after < cost_before).view(B, 1, 1)
+    return torch.where(improved, new_seeds, original_seeds)
 
 
 def reconnect( 

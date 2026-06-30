@@ -1,0 +1,47 @@
+{
+  "config": {
+    "revision_lens": [
+      100,
+      50,
+      20
+    ],
+    "revision_iters": [
+      10,
+      10,
+      5
+    ],
+    "seed": 1234,
+    "test_sizes": [
+      1000
+    ],
+    "widths": [
+      4
+    ]
+  },
+  "results": [
+    {
+      "test_size": 1000,
+      "width": 4,
+      "revision_lens": [
+        100,
+        50,
+        20
+      ],
+      "revision_iters": [
+        10,
+        10,
+        5
+      ],
+      "seed": 1234,
+      "original_cost": 24.149826049804688,
+      "conn_rev_cost": 24.063974380493164,
+      "delta": -0.08585166931152344,
+      "delta_pct": -0.35549601531070973,
+      "original_time_reported": 35.256568908691406,
+      "conn_rev_time_reported": 68.30108976364136,
+      "original_wall": 38.643784046173096,
+      "conn_rev_wall": 71.68760848045349,
+      "wall_time_ratio": 1.8550877003866482
+    }
+  ]
+}

@@ -7,8 +7,14 @@ def _to_numpy(arr):
         return arr.detach().cpu().numpy()
     if isinstance(arr, list):
         return np.array(arr)
-    else:
-        return arr
+    # Handle torch.utils.data.Dataset objects (e.g., LOCALDataset) which
+    # store their data in a `.data` attribute as a list of tensors.
+    if hasattr(arr, 'data') and isinstance(getattr(arr, 'data', None), list):
+        items = arr.data
+        if items and isinstance(items[0], torch.Tensor):
+            return np.stack([t.detach().cpu().numpy() for t in items], axis=0)
+        return np.array(items)
+    return arr
 
 def random_insertion(cities, order=None):
     cities = _to_numpy(cities)
