@@ -1,0 +1,5 @@
+# Experiment: Heatmap guided decomposition
+
+The repo `ref/AGFN` come with pretrained checkpoints that can be used to generate heatmaps of edge probabilities, and I would like to explore using this for more efficient decomposition of sub-TSPs into SHPPs. Instead of using the revisor NN of GLOP over every segment, I would like to only target the part in the current intermediate solution that aligns the least with the edge heatmap predicted by `AGFN`. Additionally, the connections of the sections selected should also be revised. You should also properly present the benchmark against the original GLOP solutions, both in terms of solution quality and time. Plot objective v.s. iteration chart for visualization. 
+
+If there's anything that you are not unclear with, make sure that you ask for clarification.
