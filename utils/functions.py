@@ -187,6 +187,33 @@ def decomposition(seeds, coordinate_dim, revision_len, offset, shift_len = 1):
     decomposed_seeds = decomposed_seeds.reshape(-1, revision_len, coordinate_dim)
     return decomposed_seeds, offset_seeds
 
+def _summarize_cost_across_width(cost, opts):
+    """Return (best, avg, count) for the --width random restarts.
+
+    `cost` has shape (width * eval_batch_size,) before pruning, or
+    (eval_batch_size,) after pruning. Reshape to (width, eval_batch_size),
+    reduce along dim=0 to get best/avg per instance, then take the mean
+    across instances for a scalar summary. Falls back to (mean, mean, n)
+    when the width axis is absent (width <= 1, or the tensor has already
+    been pruned to a single restart per element).
+    """
+    width = getattr(opts, 'width', 1)
+    eval_batch_size = getattr(opts, 'eval_batch_size', 1)
+    # Width axis is present only when the tensor really holds
+    # width * eval_batch_size instances (i.e. not pruned yet).
+    has_width_axis = (
+        width is not None and width > 1
+        and cost.numel() == width * eval_batch_size
+    )
+    if not has_width_axis:
+        # Single restart, or already pruned — best == avg == mean.
+        mean = cost.mean().item()
+        return mean, mean, cost.numel()
+    grouped = cost.reshape(width, eval_batch_size)
+    best = grouped.min(dim=0).values.mean().item()
+    avg = grouped.mean(dim=0).mean().item()
+    return best, avg, grouped.numel()
+
 def coordinate_transformation(x):
     input = x.clone()
     max_x, indices_max_x = input[:,:,0].max(dim=1)
@@ -264,15 +291,18 @@ def LCP_TSP(
     revision_len,
     revision_iter,
     opts,
-    shift_len
+    shift_len,
+    layer_id=None,
+    stats_list=None,
     ):
-    
+
     batch_size, num_nodes, coordinate_dim = seeds.shape
     offset = num_nodes % revision_len
     embeddings = None # used only in case problem_size == revision_len for efficiency
+    layer_start = time.time()  # NEW: per-layer wall-clock start
     for i in range(revision_iter):
 
-        decomposed_seeds, offset_seed = decomposition(seeds, 
+        decomposed_seeds, offset_seed = decomposition(seeds,
                                         coordinate_dim,
                                         revision_len,
                                         offset,
@@ -287,39 +317,78 @@ def LCP_TSP(
         else:
             decomposed_seeds_revised, _ = revision(opts, cost_func, reviser, decomposed_seeds, original_subtour)
 
-        seeds = decomposed_seeds_revised.reshape(batch_size, -1, coordinate_dim) 
+        seeds = decomposed_seeds_revised.reshape(batch_size, -1, coordinate_dim)
         if offset_seed is not None:
             seeds = torch.cat([seeds,offset_seed], dim=1)
+
+        # NEW: per-iteration logging — closed-loop tour cost across all --width restarts
+        cost_iter = (seeds[:, 1:] - seeds[:, :-1]).norm(p=2, dim=2).sum(1) \
+                  + (seeds[:, 0] - seeds[:, -1]).norm(p=2, dim=1)
+        best, avg, count = _summarize_cost_across_width(cost_iter, opts)
+        iter_elapsed = time.time() - layer_start
+        print('[Revisor L={:>4}] iter {:>2}/{:>2}: best={:.4f}, avg={:.4f}, elapsed={:6.2f}s'.format(
+            revision_len, i + 1, revision_iter, best, avg, iter_elapsed))
+
+        # Accumulate per-iter stats for downstream aggregation / plotting.
+        # Store as raw sums so that aggregating across batches gives the
+        # correct weighted average (batches may have different sizes).
+        if stats_list is not None:
+            stats_list.append({
+                'layer_id': layer_id,
+                'iter_id': i,
+                'sum_best': best * count,
+                'sum_avg': avg * count,
+                'count': count,
+            })
     return seeds
 
 
-def reconnect( 
+def reconnect(
         get_cost_func,
         batch,
-        opts, 
+        opts,
         revisers,
+        stats_list=None,
     ):
     seed = batch
-    problem_size = seed.size(1) 
+    problem_size = seed.size(1)
     if len(revisers) == 0:
         cost_revised = (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1) + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)
-    
+
     for revision_id in range(len(revisers)):
         assert opts.revision_lens[revision_id] <= seed.size(1)
+
+        # NEW: layer-start header
+        print('[Revisor L={:>4}] starting layer {}/{} (revision_iters={}, width={})'.format(
+            opts.revision_lens[revision_id],
+            revision_id + 1, len(revisers),
+            opts.revision_iters[revision_id],
+            getattr(opts, 'width', 1),
+        ))
+
         start_time = time.time()
         shift_len = max(opts.revision_lens[revision_id]//opts.revision_iters[revision_id], 1)
         seed = LCP_TSP(
-            seed, 
+            seed,
             get_cost_func,
             revisers[revision_id],
             opts.revision_lens[revision_id],
             opts.revision_iters[revision_id],
             opts=opts,
-            shift_len=shift_len
+            shift_len=shift_len,
+            layer_id=revision_id,
+            stats_list=stats_list,
             )
-        cost_revised = (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1) + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)      
+        cost_revised = (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1) + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)
         duration = time.time() - start_time
-        
+
+        # NEW: layer-end summary — best/avg across --width restarts, aggregated over eval batch
+        best, avg, _ = _summarize_cost_across_width(cost_revised, opts)
+        print('[Revisor L={:>4}] layer {}/{} done: time={:6.2f}s, best={:.4f}, avg={:.4f}'.format(
+            opts.revision_lens[revision_id], revision_id + 1, len(revisers),
+            duration, best, avg,
+        ))
+
         if revision_id == 0 and not opts.no_prune: # eliminate the underperforming ones after the first round of revisions
             cost_revised, cost_revised_minidx = cost_revised.reshape(-1, opts.eval_batch_size).min(0) # width, bs
             seed = seed.reshape(-1, opts.eval_batch_size, seed.shape[-2], 2)[cost_revised_minidx, torch.arange(opts.eval_batch_size)]
@@ -328,7 +397,7 @@ def reconnect(
             seed = seed.reshape(-1, opts.eval_batch_size, seed.shape[-2], 2)[cost_revised_minidx, torch.arange(opts.eval_batch_size)]
     assert cost_revised.shape == (opts.eval_batch_size,)
     assert seed.shape == (opts.eval_batch_size, problem_size, 2)
-        
+
     return seed, cost_revised
 
 
