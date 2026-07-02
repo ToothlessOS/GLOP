@@ -31,26 +31,39 @@ def eval_dataset(dataset_path, opts):
         reviser.eval()
         reviser.set_decode_type(opts.decode_strategy)
         
-    results, duration = _eval_dataset(dataset_path, opts, opts.device, revisers)
+    results, duration, all_stats = _eval_dataset(dataset_path, opts, opts.device, revisers)
 
-    costs, costs_revised, costs_revised_with_penalty, tours = zip(*results)
-    costs = torch.tensor(costs)
+    costs, costs_revised, costs_revised_with_penalty, costs_warm_avg, tours = zip(*results)
+    costs = torch.tensor(costs)               # best-of-width warm start per instance
+    costs_warm_avg = torch.tensor(costs_warm_avg)  # avg-of-width warm start per instance
     if opts.problem_type in ['cvrp', 'cvrplib']:
         costs_revised = torch.stack(costs_revised)
     else:
         costs_revised = torch.cat(costs_revised, dim=0)
-    
+
     if opts.problem_type == 'pctsp':
         costs_revised_with_penalty = torch.cat(costs_revised_with_penalty, dim=0)
 
-    print("Average cost: {} +- {}".format(costs.mean(), (2 * torch.std(costs) / math.sqrt(len(costs))).item()))
-    print("Average cost_revised: {} +- {}".format(costs_revised.mean().item(), 
-                            (2 * torch.std(costs_revised) / math.sqrt(len(costs_revised))).item()))
+    def _ci(t):
+        return (2 * torch.std(t) / math.sqrt(len(t))).item()
+
+    print("=== Warm start (random insertion) ===")
+    print("  avg  = {:.4f} +- {:.4f}".format(costs_warm_avg.mean().item(), _ci(costs_warm_avg)))
+    print("  best = {:.4f} +- {:.4f}".format(costs.mean().item(), _ci(costs)))
+    print("=== Final (after LCP revision) ===")
+    print("  avg  = {:.4f} +- {:.4f}".format(costs_revised.mean().item(), _ci(costs_revised)))
+    print("  best = {:.4f}".format(costs_revised.min().item()))
     if opts.problem_type == 'pctsp':
-        print("Average cost_revised with penalty: {} +- {}".format(costs_revised_with_penalty.mean().item(), 
-                            (2 * torch.std(costs_revised_with_penalty) / math.sqrt(len(costs_revised_with_penalty))).item()))
-    print("Total duration: {}".format(duration))
-    
+        print("=== Final with penalty ===")
+        print("  avg  = {:.4f} +- {:.4f}".format(costs_revised_with_penalty.mean().item(),
+                                                _ci(costs_revised_with_penalty)))
+        print("  best = {:.4f}".format(costs_revised_with_penalty.min().item()))
+    print("=== Total duration: {:.2f}s ===".format(duration))
+
+    # Aggregate per-iteration stats across batches (weighted by count) and plot.
+    if all_stats:
+        plot_solver_curve(all_stats, opts)
+
     if opts.problem_type != 'cvrp':
         tours = torch.cat(tours, dim=0)
     return tours
@@ -96,6 +109,7 @@ def _eval_dataset(dataset_path, opts, device, revisers):
     get_cost_func = lambda input, pi: problem.get_costs(input, pi, return_local=True)
     
     results = []
+    all_stats = []  # accumulated per-iter (best, avg, count) across batches
     for batch_id, batch in tqdm(enumerate(dataloader), disable=opts.no_progress_bar):
         # tsp batch shape: (bs, problem size, 2)
         avg_cost = 0
@@ -123,10 +137,14 @@ def _eval_dataset(dataset_path, opts, device, revisers):
             seed = seed.to(device)
             cost_ori = (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1) + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)
             if opts.problem_type in ['tsp', 'pctsp']:
-                cost_ori, _ = cost_ori.reshape(-1, opts.eval_batch_size).min(0) # width, bs
-                avg_cost = cost_ori.mean().item()
+                cost_ori_grouped = cost_ori.reshape(-1, opts.eval_batch_size)  # (width, eval_batch_size)
+                cost_ori_best, _ = cost_ori_grouped.min(0)
+                cost_ori_avg = cost_ori_grouped.mean(0)
+                avg_cost = cost_ori_best.mean().item()
+                avg_cost_warm = cost_ori_avg.mean().item()
             elif opts.problem_type in ['cvrp', 'cvrplib']:
                 avg_cost = sum_cost(cost_ori, n_tsps_per_route).min()
+                avg_cost_warm = float(cost_ori.mean().item())  # width=1 forced for CVRP/CVRPLIB
             else:
                 raise NotImplementedError
 
@@ -136,11 +154,12 @@ def _eval_dataset(dataset_path, opts, device, revisers):
                 seed4 = torch.cat((1 - seed[:, :, [0]], 1 - seed[:, :, [1]]), dim=2)
                 seed = torch.cat((seed, seed2, seed3, seed4), dim=0)
                 
-            tours, costs_revised = reconnect( 
+            tours, costs_revised = reconnect(
                                         get_cost_func=get_cost_func,
                                         batch=seed,
                                         opts=opts,
                                         revisers=revisers,
+                                        stats_list=all_stats,
                                         )
 
         if opts.problem_type == 'pctsp':
@@ -158,17 +177,102 @@ def _eval_dataset(dataset_path, opts, device, revisers):
             tours = tours.reshape(-1, 2)
         
         if opts.problem_type == 'pctsp':
-            results.append((avg_cost, costs_revised, costs_revised_with_penalty, tours))
+            results.append((avg_cost, costs_revised, costs_revised_with_penalty, avg_cost_warm, tours))
         elif opts.problem_type in ['tsp', 'cvrp', 'cvrplib']:
-            results.append((avg_cost, costs_revised, None, tours))
+            results.append((avg_cost, costs_revised, None, avg_cost_warm, tours))
         else:
             raise NotImplementedError
-        
+
 
     duration = time.time() - start
 
-    return results, duration               
-            
+    return results, duration, all_stats
+
+
+def _aggregate_solver_curve(all_stats):
+    """Aggregate per-batch per-iter stats into per-(layer, iter) means.
+
+    Each input entry has keys {layer_id, iter_id, sum_best, sum_avg, count}.
+    We sum across batches and divide by the total count for each (layer, iter).
+    Returns a dict: {layer_id: {'iters': [...], 'best': [...], 'avg': [...]}}.
+    """
+    agg = {}
+    for s in all_stats:
+        key = (s['layer_id'], s['iter_id'])
+        if key not in agg:
+            agg[key] = {'sum_best': 0.0, 'sum_avg': 0.0, 'count': 0}
+        agg[key]['sum_best'] += s['sum_best']
+        agg[key]['sum_avg'] += s['sum_avg']
+        agg[key]['count'] += s['count']
+    layers = sorted({k[0] for k in agg.keys()})
+    out = {}
+    for lid in layers:
+        iters = sorted(k[1] for k in agg.keys() if k[0] == lid)
+        best, avg = [], []
+        for it in iters:
+            entry = agg[(lid, it)]
+            best.append(entry['sum_best'] / max(entry['count'], 1))
+            avg.append(entry['sum_avg'] / max(entry['count'], 1))
+        out[lid] = {'iters': iters, 'best': best, 'avg': avg}
+    return out
+
+
+def plot_solver_curve(all_stats, opts):
+    """Plot avg/best cost per iteration for each revisor layer."""
+    import os
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    agg = _aggregate_solver_curve(all_stats)
+    if not agg:
+        return
+
+    layers = sorted(agg.keys())
+    n_layers = len(layers)
+    fig, axes = plt.subplots(1, n_layers, figsize=(5 * n_layers, 4.5), sharey=True)
+    if n_layers == 1:
+        axes = [axes]
+    colors = plt.cm.viridis([i / max(n_layers - 1, 1) for i in range(n_layers)])
+
+    for ax, lid, color in zip(axes, layers, colors):
+        data = agg[lid]
+        x = [it + 1 for it in data['iters']]
+        ax.plot(x, data['avg'], '--', color=color, linewidth=2.0,
+                marker='o', markersize=5, label='avg across --width')
+        ax.plot(x, data['best'], '-', color=color, linewidth=2.0,
+                marker='s', markersize=5, label='best across --width')
+        ax.set_title(f'Layer {lid + 1}: L={opts.revision_lens[lid]} '
+                     f'({opts.revision_iters[lid]} iters)')
+        ax.set_xlabel('Iteration within layer')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='best', fontsize=8)
+        if data['best']:
+            ax.annotate(f"{data['best'][0]:.3f}", xy=(x[0], data['best'][0]),
+                        xytext=(3, 5), textcoords='offset points', fontsize=8,
+                        color=color)
+            ax.annotate(f"{data['best'][-1]:.3f}", xy=(x[-1], data['best'][-1]),
+                        xytext=(-25, 5), textcoords='offset points', fontsize=8,
+                        color=color)
+
+    axes[0].set_ylabel('Closed-loop tour cost\n(eval-dataset mean)')
+    fig.suptitle(f'GLOP sub-TSP solver convergence — '
+                 f'{opts.problem_type}{opts.problem_size}, width={opts.width}, val_size={opts.val_size}',
+                 fontsize=11)
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.85)
+
+    out_dir = 'results'
+    os.makedirs(out_dir, exist_ok=True)
+    tag = (f"{opts.problem_type}{opts.problem_size}_w{opts.width}"
+           f"_lens{'-'.join(str(x) for x in opts.revision_lens)}"
+           f"_iters{'-'.join(str(x) for x in opts.revision_iters)}")
+    out_path = os.path.join(out_dir, f'solver_curve_{tag}.png')
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"=== Solver curve saved to: {out_path} ===")
+
+
 if __name__ == "__main__":
  
     parser = argparse.ArgumentParser()

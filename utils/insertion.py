@@ -7,8 +7,13 @@ def _to_numpy(arr):
         return arr.detach().cpu().numpy()
     if isinstance(arr, list):
         return np.array(arr)
-    else:
-        return arr
+    # Handle torch Dataset objects (LOCALDataset, TSPDataset): their `.data`
+    # attribute is a list of (problem_size, 2) tensors that we stack into a
+    # (num_samples, problem_size, 2) tensor before passing to the C library.
+    if hasattr(arr, 'data') and isinstance(getattr(arr, 'data', None), list) \
+            and len(arr.data) > 0 and isinstance(arr.data[0], torch.Tensor):
+        return torch.stack(arr.data).detach().cpu().numpy()
+    return arr
 
 def random_insertion(cities, order=None):
     cities = _to_numpy(cities)
