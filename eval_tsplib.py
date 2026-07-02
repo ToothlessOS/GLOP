@@ -165,6 +165,12 @@ if __name__ == "__main__":
     parser.add_argument('--path', type=str, default='', 
                         help='The test dataset path for cross-distribution evaluation')
     parser.add_argument('--no_prune', action='store_true', help='Do not prune the unpromising tours after the first round of revisions')
+    parser.add_argument('--do_block_2opt', dest='do_block_2opt', action='store_true', default=True,
+                        help='Apply block-level (hypernode) 2-opt after each revision iteration (default: True)')
+    parser.add_argument('--no_block_2opt', dest='do_block_2opt', action='store_false',
+                        help='Disable block-level (hypernode) 2-opt')
+    parser.add_argument('--block_swap_max_iter', type=int, default=10,
+                        help='Maximum passes of best-of-pass block-swap search per revision iteration')
     opts = parser.parse_args()
     if opts.path == '':
         dataset_path = f'data/tsp/tsp{opts.problem_size}_test.pkl'

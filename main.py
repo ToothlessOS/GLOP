@@ -301,6 +301,12 @@ if __name__ == "__main__":
     parser.add_argument('--n_partition', type=int, default=1, help='The number of stochastically constructed CVRP partitions')
     parser.add_argument('--ckpt_path', type=str, default='', help='Checkpoint path for CVRP eval')
     parser.add_argument('--no_prune', action='store_true', help='Do not prune the unpromising tours after the first round of revisions')
+    parser.add_argument('--do_block_2opt', dest='do_block_2opt', action='store_true', default=True,
+                        help='Apply block-level (hypernode) 2-opt after each revision iteration (default: True)')
+    parser.add_argument('--no_block_2opt', dest='do_block_2opt', action='store_false',
+                        help='Disable block-level (hypernode) 2-opt')
+    parser.add_argument('--block_swap_max_iter', type=int, default=10,
+                        help='Maximum passes of best-of-pass block-swap search per revision iteration')
     opts = parser.parse_args()
 
     use_cuda = torch.cuda.is_available() and not opts.no_cuda
