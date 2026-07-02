@@ -48,7 +48,10 @@ def plot_problem_size(
     with open(raw_path) as f:
         raw = json.load(f)
 
-    cost_baseline = aggregate(raw["baseline"]["history"])
+    has_baseline = "baseline" in raw
+    cost_baseline = (
+        aggregate(raw["baseline"]["history"]) if has_baseline else None
+    )
     cost_guided = aggregate(raw["guided"]["history"])
     cost_ori_mean = float(np.mean(raw["cost_ori"]))
 
@@ -57,10 +60,10 @@ def plot_problem_size(
     stages_guided = [h["stage"] for h in raw["guided"]["history"]]
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
-    iters_b = np.arange(1, len(cost_baseline) + 1)
     iters_g = np.arange(1, len(cost_guided) + 1)
-
-    ax.plot(iters_b, cost_baseline, label="GLOP baseline", color="tab:blue", lw=2)
+    if has_baseline:
+        iters_b = np.arange(1, len(cost_baseline) + 1)
+        ax.plot(iters_b, cost_baseline, label="GLOP baseline", color="tab:blue", lw=2)
     ax.plot(iters_g, cost_guided, label="Heatmap-guided", color="tab:red", lw=2)
     ax.axhline(
         cost_ori_mean, color="gray", linestyle="--", lw=1, label="warm start"

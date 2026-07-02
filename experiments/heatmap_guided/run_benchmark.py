@@ -249,7 +249,19 @@ def glop_reconnect_with_history(
                 # the run looks hung.
                 done = len(history)
                 total = sum(opts.revision_iters)
+                # `cost_ori` reports best-of-width per instance (averaged),
+                # but the cascade runs on all (width*val_size) tours so a
+                # naive `cost.mean()` mixes bad warm-starts with good ones.
+                # Show both: `cost` (best, comparable to `cost_ori`) and
+                # `mean` (true mean over all warm-starts).
                 mean_cost = cost.mean().item()
+                if opts.width > 1:
+                    n_inst = cost.size(0) // opts.width
+                    cost_best = (
+                        cost.reshape(n_inst, opts.width).min(1).values.mean().item()
+                    )
+                else:
+                    cost_best = mean_cost
                 dt = history[-1]["t"]
                 # Running-mean dt for this stage so ETA smooths the
                 # first iteration.
@@ -261,7 +273,8 @@ def glop_reconnect_with_history(
                     f"    [cascade] stage {stage_id}/{len(opts.revision_lens)-1} "
                     f"(L={reviser_size}) iter {it+1}/{n_iter}  "
                     f"global {done}/{total}  "
-                    f"cost={mean_cost:.4f}  dt={dt:.2f}s  eta={eta:.0f}s",
+                    f"cost={cost_best:.4f}  mean={mean_cost:.4f}  "
+                    f"dt={dt:.2f}s  eta={eta:.0f}s",
                     flush=True,
                 )
         # Mirror the guided arm: free intermediate references between
@@ -393,15 +406,23 @@ def main(opts) -> None:
     # ---------------- Baseline (GLOP cascade) ----------------
     # The baseline does not need `pi` — `glop_reconnect_with_history`
     # operates on coords only. `pi` is only required by the guided arm.
-    print("[*] Running GLOP baseline (reconnect)")
-    seed_baseline = seed.clone()
-    t0 = time.time()
-    seed_b_final, _, hist_baseline = glop_reconnect_with_history(
-        get_cost_func, seed_baseline, opts, revisers
-    )
-    t_baseline = time.time() - t0
-    cost_baseline = closed_loop_cost(seed_b_final)
-    print(f"    -> baseline cost {cost_baseline.mean().item():.4f} in {t_baseline:.1f}s")
+    cost_baseline = None
+    t_baseline = 0.0
+    hist_baseline = []
+    if not opts.no_baseline:
+        print("[*] Running GLOP baseline (reconnect)")
+        seed_baseline = seed.clone()
+        t0 = time.time()
+        seed_b_final, _, hist_baseline = glop_reconnect_with_history(
+            get_cost_func, seed_baseline, opts, revisers
+        )
+        t_baseline = time.time() - t0
+        cost_baseline = closed_loop_cost(seed_b_final)
+        print(
+            f"    -> baseline cost {cost_baseline.mean().item():.4f} in {t_baseline:.1f}s"
+        )
+    else:
+        print("[*] Skipping GLOP baseline (--no_baseline)")
 
     # ---------------- Heatmap-guided ----------------
     print(f"[*] Loading AGFN (scale={opts.problem_size})")
@@ -431,16 +452,17 @@ def main(opts) -> None:
         "revision_lens": opts.revision_lens,
         "revision_iters": opts.revision_iters,
         "cost_ori": cost_ori.detach().cpu().tolist(),
-        "baseline": {
+    }
+    if not opts.no_baseline:
+        raw["baseline"] = {
             "cost": cost_baseline.detach().cpu().tolist(),
             "history": hist_baseline,
             "wall_time": t_baseline,
-        },
-        "guided": {
-            "cost": cost_g_final.detach().cpu().tolist(),
-            "history": hist_guided,
-            "wall_time": t_guided,
-        },
+        }
+    raw["guided"] = {
+        "cost": cost_g_final.detach().cpu().tolist(),
+        "history": hist_guided,
+        "wall_time": t_guided,
     }
     raw_path = os.path.join(opts.out_dir, "raw.json")
     with open(raw_path, "w") as f:
@@ -451,9 +473,16 @@ def main(opts) -> None:
     summary_lines = [
         "method,mean_cost,std_cost,wall_time_s",
         f"warm_start,{cost_ori.mean().item():.6f},{cost_ori.std().item():.6f},0.0",
-        f"glop_baseline,{cost_baseline.mean().item():.6f},{cost_baseline.std().item():.6f},{t_baseline:.2f}",
-        f"heatmap_guided,{cost_g_final.mean().item():.6f},{cost_g_final.std().item():.6f},{t_guided:.2f}",
     ]
+    if not opts.no_baseline:
+        summary_lines.append(
+            f"glop_baseline,{cost_baseline.mean().item():.6f},"
+            f"{cost_baseline.std().item():.6f},{t_baseline:.2f}"
+        )
+    summary_lines.append(
+        f"heatmap_guided,{cost_g_final.mean().item():.6f},"
+        f"{cost_g_final.std().item():.6f},{t_guided:.2f}"
+    )
     summary_path = os.path.join(opts.out_dir, "summary.csv")
     with open(summary_path, "w") as f:
         f.write("\n".join(summary_lines) + "\n")
@@ -463,7 +492,10 @@ def main(opts) -> None:
     print("=" * 60)
     print(f"TSP-{opts.problem_size} (val_size={opts.val_size}, width={opts.width})")
     print(f"  warm_start : {cost_ori.mean().item():.4f}")
-    print(f"  glop       : {cost_baseline.mean().item():.4f}   [{t_baseline:.1f}s]")
+    if not opts.no_baseline:
+        print(f"  glop       : {cost_baseline.mean().item():.4f}   [{t_baseline:.1f}s]")
+    else:
+        print("  glop       : (skipped --no_baseline)")
     print(f"  guided     : {cost_g_final.mean().item():.4f}   [{t_guided:.1f}s]")
     print("=" * 60)
 
@@ -498,6 +530,12 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, default=10)
     parser.add_argument("--no_aug", action="store_true")
     parser.add_argument("--no_prune", action="store_true")
+    parser.add_argument(
+        "--no_baseline",
+        action="store_true",
+        help="Skip the GLOP baseline cascade. The raw.json will omit "
+        "the 'baseline' key; only the heatmap-guided arm runs.",
+    )
     parser.add_argument("--decode_strategy", type=str, default="greedy")
     parser.add_argument(
         "--device",

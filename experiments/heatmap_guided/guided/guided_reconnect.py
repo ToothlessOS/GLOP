@@ -76,6 +76,11 @@ def guided_reconnect(
         # Disabling autograd is the dominant memory fix: every reviser
         # forward + gather would otherwise stay attached to the autograd
         # graph and accumulate ~O(iters * L * embed_dim) of graph nodes.
+        print(
+            f"    [cascade] stage {stage_id}/{len(opts.revision_lens)-1} "
+            f"start: L={reviser_size}, n_iter={n_iter}",
+            flush=True,
+        )
         with torch.no_grad():
             exclude = torch.zeros(
                 B, N, dtype=torch.bool, device=seed.device
@@ -126,6 +131,41 @@ def guided_reconnect(
                         "cost": cost.detach().cpu().tolist(),
                         "t": time.time() - t0,
                     }
+                )
+                # Per-iter progress to match `glop_reconnect_with_history`
+                # byte-for-byte (including the `flush=True` requirement
+                # when stdout is piped via nohup/tee). `done` is
+                # 1-indexed across the entire cascade (matches the
+                # baseline), and `eta` is a running-mean-per-stage so
+                # the first iter doesn't inflate the estimate.
+                #
+                # `cost_ori` reports best-of-width per instance (averaged),
+                # but the cascade runs on all (width*val_size) tours so a
+                # naive `cost.mean()` mixes bad warm-starts with good ones.
+                # Show both: `cost` (best, comparable to `cost_ori`) and
+                # `mean` (true mean over all warm-starts).
+                done = len(history)
+                total = sum(opts.revision_iters)
+                mean_cost = cost.mean().item()
+                if opts.width > 1:
+                    n_inst = cost.size(0) // opts.width
+                    cost_best = (
+                        cost.reshape(n_inst, opts.width).min(1).values.mean().item()
+                    )
+                else:
+                    cost_best = mean_cost
+                dt = history[-1]["t"]
+                avg_dt = sum(
+                    h["t"] for h in history if h["stage"] == stage_id
+                ) / (it + 1)
+                eta = avg_dt * (n_iter - (it + 1))
+                print(
+                    f"    [cascade] stage {stage_id}/{len(opts.revision_lens)-1} "
+                    f"(L={reviser_size}) iter {it+1}/{n_iter}  "
+                    f"global {done}/{total}  "
+                    f"cost={cost_best:.4f}  mean={mean_cost:.4f}  "
+                    f"dt={dt:.2f}s  eta={eta:.0f}s",
+                    flush=True,
                 )
             # End of stage: drop the exclude mask and any stage-local
             # tensors so the next stage starts with a clean slate.
