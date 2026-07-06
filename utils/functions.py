@@ -458,7 +458,7 @@ def _block_swap_two_opt(seeds, revision_len, offset, max_iter=10, eps=-1e-9):
             1, perm.view(B, S, 1, 1).expand(-1, -1, revision_len, D)
         )
         delta = _block_swap_delta(aligned_perm, j_idx, k_idx)  # (B, P)
-        best_delta, best_pair = delta.min(dim=1)               # (B,), (B,)
+        best_delta, best_pair = delta.min(dim=1)  # (B,), (B,)
         improving = best_delta < eps
         if not improving.any():
             break
@@ -466,8 +466,8 @@ def _block_swap_two_opt(seeds, revision_len, offset, max_iter=10, eps=-1e-9):
         # j_sel / k_sel are POSITIONS in the current permuted view. Swap
         # perm entries at those positions: this is the canonical swap move
         # on the hypernode-level tour.
-        j_sel = j_idx[best_pair]                               # (B,)
-        k_sel = k_idx[best_pair]                               # (B,)
+        j_sel = j_idx[best_pair]  # (B,)
+        k_sel = k_idx[best_pair]  # (B,)
         old_j_perm = perm[rows, j_sel].clone()
         old_k_perm = perm[rows, k_sel].clone()
         perm[rows, j_sel] = torch.where(improving, old_k_perm, perm[rows, j_sel])
@@ -487,25 +487,66 @@ def _block_swap_two_opt(seeds, revision_len, offset, max_iter=10, eps=-1e-9):
             for i in range(S):
                 orig_idx = int(perm[b, i].item())
                 if orig_idx == S - 1:
-                    block = tail[b]                            # (offset, D)
+                    block = tail[b]  # (offset, D)
                 else:
-                    block = aligned[b, orig_idx]              # (L, D)
+                    block = aligned[b, orig_idx]  # (L, D)
                 out[b, pos : pos + block.shape[0], :] = block
                 pos += block.shape[0]
         return out
     else:
         # No offset: same as the offset branch but using aligned for every
         # block (all blocks are size revision_len).
-        out = torch.empty(
-            B, n_aligned, D, device=seeds.device, dtype=seeds.dtype
-        )
+        out = torch.empty(B, n_aligned, D, device=seeds.device, dtype=seeds.dtype)
         for b in range(B):
             pos = 0
             for i in range(S):
-                block = aligned[b, int(perm[b, i].item())]   # (L, D)
+                block = aligned[b, int(perm[b, i].item())]  # (L, D)
                 out[b, pos : pos + block.shape[0], :] = block
                 pos += block.shape[0]
         return out
+
+
+def _run_diagnostics(seeds, revision_len):
+    """Run heuristic-validity diagnostics on the sub-TSP `seeds` and print a
+    single summary line matching the existing `[Revisor L=...]` format.
+
+    Returns a dict so callers can stash the per-batch numbers in `stats_list`.
+    Lazy-imports `utils.diagnosis` to keep the import surface minimal when
+    diagnostics are disabled.
+    """
+    from utils.diagnosis import check_no_self_intersection, check_convex_hull
+
+    has_inter, _, frac_inter, n_pairs, _ = check_no_self_intersection(seeds)
+    consistency, _ = check_convex_hull(seeds)
+
+    B = seeds.shape[0]
+    n_intersecting = int(has_inter.sum().item())
+    n_consistent = int((consistency > 0.5).sum().item())
+    mean_frac = float(frac_inter.mean().item()) if frac_inter.numel() else 0.0
+    mean_pairs = float(n_pairs.float().mean().item()) if n_pairs.numel() else 0.0
+
+    print(
+        "[Revisor L={:>4}] diag: self-intersect={}/{} ({:5.1f}%), "
+        "convex-hull-OK={}/{} ({:5.1f}%), "
+        "mean-frac-intersect={:.4f}, mean-valid-pairs={:.0f}".format(
+            revision_len,
+            n_intersecting,
+            B,
+            100.0 * n_intersecting / max(B, 1),
+            n_consistent,
+            B,
+            100.0 * n_consistent / max(B, 1),
+            mean_frac,
+            mean_pairs,
+        )
+    )
+    return {
+        "n_intersecting": n_intersecting,
+        "n_consistent": n_consistent,
+        "total": B,
+        "mean_frac_intersections": mean_frac,
+        "mean_valid_pairs": mean_pairs,
+    }
 
 
 def LCP_TSP(
@@ -523,6 +564,17 @@ def LCP_TSP(
     batch_size, num_nodes, coordinate_dim = seeds.shape
     offset = num_nodes % revision_len
     embeddings = None  # used only in case problem_size == revision_len for efficiency
+
+    # NEW: heuristic-validity diagnostics on the input sub-TSP. Gated by
+    # --diagnose / --no_diagnose. Skipped when `seeds` is a single-segment
+    # subproblem (num_nodes <= revision_len would mean it is already a single
+    # revision target; we still run if num_nodes > revision_len since that's
+    # the case where decompose-on-edge becomes interesting).
+    if getattr(opts, "diagnose", False):
+        diag = _run_diagnostics(seeds, revision_len)
+        if stats_list is not None:
+            stats_list.append({"iter_id": -1, **diag})
+
     layer_start = time.time()  # NEW: per-layer wall-clock start
     for i in range(revision_iter):
 
@@ -609,6 +661,16 @@ def LCP_TSP(
                 )
             )
 
+        # NEW: heuristic-validity diagnostics on the input sub-TSP. Gated by
+        # --diagnose / --no_diagnose. Skipped when `seeds` is a single-segment
+        # subproblem (num_nodes <= revision_len would mean it is already a single
+        # revision target; we still run if num_nodes > revision_len since that's
+        # the case where decompose-on-edge becomes interesting).
+        if getattr(opts, "diagnose", False):
+            diag = _run_diagnostics(seeds, revision_len)
+            if stats_list is not None:
+                stats_list.append({"iter_id": -1, **diag})
+
         # Accumulate per-iter stats for downstream aggregation / plotting.
         # Store as raw sums so that aggregating across batches gives the
         # correct weighted average (batches may have different sizes).
@@ -623,6 +685,95 @@ def LCP_TSP(
                 }
             )
     return seeds
+
+
+def run_post_revision(
+    tours,
+    revisers,
+    get_cost_func,
+    opts,
+    post_revision_lens,
+    post_revision_iters,
+    stats_list=None,
+):
+    """Treat ``tours`` (B, N, 2) as a warm-start seed and run additional
+    revisor passes. Width is implicitly 1 (no width-axis reduction).
+    Standalone helper — not wired into the main pipeline by default;
+    call it from your own script after :func:`fix_intersections_via_2opt`
+    or any other pre-processing.
+
+    Args:
+        tours: (B, N, 2) coordinate-ordered warm-start seed.
+        revisers: list of nn.Module revisor models, one per layer.
+        get_cost_func: same callable shape used by :func:`reconnect`
+            (``(input, pi) -> cost``).
+        opts: argparse Namespace; needs ``.revision_lens``,
+            ``.revision_iters``, ``.decode_strategy``, ``.device``, etc.
+        post_revision_lens: list of int; revisor window sizes per layer.
+        post_revision_iters: list of int; iterations per layer. Must have
+            the same length as ``post_revision_lens``.
+        stats_list: optional list mutated in place with per-iter stats
+            (same format as :func:`LCP_TSP`).
+
+    Returns:
+        (tours_out, costs_out) with shapes ``(B, N, 2)`` and ``(B,)``.
+    """
+    seed = tours
+    problem_size = seed.size(1)
+
+    if len(revisers) == 0:
+        costs_out = (
+            (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1)
+            + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)
+        )
+        return seed, costs_out
+
+    for layer_id, (reviser, rl, ri) in enumerate(
+        zip(revisers, post_revision_lens, post_revision_iters)
+    ):
+        print(
+            "[POST Revisor L={:>4}] starting layer {}/{} "
+            "(revision_iters={}, width=1)".format(
+                rl, layer_id + 1, len(revisers), ri
+            )
+        )
+
+        start_time = time.time()
+        shift_len = max(rl // ri, 1)
+        # layer_id + 1000 sentinel keeps post-revisor entries out of the
+        # same (layer_id, iter_id) namespace as the original revisor.
+        seed = LCP_TSP(
+            seed,
+            get_cost_func,
+            reviser,
+            rl,
+            ri,
+            opts=opts,
+            shift_len=shift_len,
+            layer_id=layer_id + 1000,
+            stats_list=stats_list,
+        )
+        layer_elapsed = time.time() - start_time
+
+        cost_layer = (
+            (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1)
+            + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)
+        )
+        # width=1: best == avg == mean.
+        print(
+            "[POST Revisor L={:>4}] layer {}/{} done: "
+            "time={:6.2f}s, cost={:.4f}".format(
+                rl, layer_id + 1, len(revisers), layer_elapsed, cost_layer.mean().item()
+            )
+        )
+
+    costs_out = (
+        (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1)
+        + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)
+    )
+    assert seed.shape == (seed.shape[0], problem_size, 2)
+    assert costs_out.shape == (seed.shape[0],)
+    return seed, costs_out
 
 
 def reconnect(
