@@ -687,6 +687,103 @@ def LCP_TSP(
     return seeds
 
 
+def _run_post_revision_full(
+    seed,
+    revisers,
+    get_cost_func,
+    opts,
+    post_revision_lens,
+    post_revision_iters,
+    stats_list=None,
+    chunk_id=None,
+    n_chunks=None,
+):
+    """Inner helper that drives the revisor stack over a single ``(B, N, 2)``
+    seed without chunking. Used by :func:`run_post_revision` either directly
+    (when ``batch_size`` is unset or already fits) or once per chunk.
+
+    Wraps each ``LCP_TSP`` call in ``torch.no_grad()`` to avoid building the
+    autograd graph during inference (the original ``reconnect`` pass already
+    does this), and calls ``torch.cuda.empty_cache()`` between layers to
+    release accumulated allocator blocks.
+    """
+    problem_size = seed.size(1)
+
+    if len(revisers) == 0:
+        costs_out = (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1) + (
+            seed[:, 0] - seed[:, -1]
+        ).norm(p=2, dim=1)
+        return seed, costs_out
+
+    chunk_tag = ""
+    if chunk_id is not None and n_chunks is not None:
+        chunk_tag = f" [chunk {chunk_id + 1}/{n_chunks}]"
+
+    for layer_id, (reviser, rl, ri) in enumerate(
+        zip(revisers, post_revision_lens, post_revision_iters)
+    ):
+        print(
+            "[POST Revisor L={:>4}]{} starting layer {}/{} "
+            "(revision_iters={}, width=1)".format(
+                rl, chunk_tag, layer_id + 1, len(revisers), ri
+            )
+        )
+
+        print(
+            "[INFO] Current VRAM usage: {:.2f} GB".format(
+                torch.cuda.memory_allocated() / 1e9
+            )
+        )
+
+        start_time = time.time()
+        shift_len = max(rl // ri, 1)
+        # layer_id + 1000 sentinel keeps post-revisor entries out of the
+        # same (layer_id, iter_id) namespace as the original revisor.
+        # Wrap in no_grad so we don't build the autograd graph during
+        # inference — this is the same wrap the original ``reconnect``
+        # pass uses and is the largest single VRAM win.
+        with torch.no_grad():
+            seed = LCP_TSP(
+                seed,
+                get_cost_func,
+                reviser,
+                rl,
+                ri,
+                opts=opts,
+                shift_len=shift_len,
+                layer_id=layer_id + 1000,
+                stats_list=stats_list,
+            )
+        # Release allocator-held blocks from this layer's activations
+        # before the next layer's revisor forward pass allocates again.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        layer_elapsed = time.time() - start_time
+
+        cost_layer = (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1) + (
+            seed[:, 0] - seed[:, -1]
+        ).norm(p=2, dim=1)
+        # width=1: best == avg == mean.
+        print(
+            "[POST Revisor L={:>4}]{} layer {}/{} done: "
+            "time={:6.2f}s, cost={:.4f}".format(
+                rl,
+                chunk_tag,
+                layer_id + 1,
+                len(revisers),
+                layer_elapsed,
+                cost_layer.mean().item(),
+            )
+        )
+
+    costs_out = (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1) + (
+        seed[:, 0] - seed[:, -1]
+    ).norm(p=2, dim=1)
+    assert seed.shape == (seed.shape[0], problem_size, 2)
+    assert costs_out.shape == (seed.shape[0],)
+    return seed, costs_out
+
+
 def run_post_revision(
     tours,
     revisers,
@@ -695,6 +792,7 @@ def run_post_revision(
     post_revision_lens,
     post_revision_iters,
     stats_list=None,
+    batch_size=None,
 ):
     """Treat ``tours`` (B, N, 2) as a warm-start seed and run additional
     revisor passes. Width is implicitly 1 (no width-axis reduction).
@@ -713,67 +811,63 @@ def run_post_revision(
         post_revision_iters: list of int; iterations per layer. Must have
             the same length as ``post_revision_lens``.
         stats_list: optional list mutated in place with per-iter stats
-            (same format as :func:`LCP_TSP`).
+            (same format as :func:`LCP_TSP`). Ignored when chunking.
+        batch_size: optional int. If set and the input ``tours`` has more
+            than ``batch_size`` rows, the seed is chunked along dim 0 and
+            each chunk is processed independently before the results are
+            concatenated. Lets users cap peak VRAM when the post-revisor
+            stack is memory-heavy. Mirrors the
+            :func:`utils.tensor_functions.compute_in_batches` pattern.
 
     Returns:
         (tours_out, costs_out) with shapes ``(B, N, 2)`` and ``(B,)``.
+
+    Note:
+        Each per-layer ``LCP_TSP`` call is wrapped in ``torch.no_grad()``
+        so the autograd graph is not retained during inference, and
+        ``torch.cuda.empty_cache()`` is called between layers to release
+        accumulated allocator blocks. This mirrors what the original
+        ``reconnect`` pass already does.
     """
-    seed = tours
-    problem_size = seed.size(1)
-
-    if len(revisers) == 0:
-        costs_out = (
-            (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1)
-            + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)
-        )
-        return seed, costs_out
-
-    for layer_id, (reviser, rl, ri) in enumerate(
-        zip(revisers, post_revision_lens, post_revision_iters)
-    ):
-        print(
-            "[POST Revisor L={:>4}] starting layer {}/{} "
-            "(revision_iters={}, width=1)".format(
-                rl, layer_id + 1, len(revisers), ri
-            )
-        )
-
-        start_time = time.time()
-        shift_len = max(rl // ri, 1)
-        # layer_id + 1000 sentinel keeps post-revisor entries out of the
-        # same (layer_id, iter_id) namespace as the original revisor.
-        seed = LCP_TSP(
-            seed,
+    if batch_size is None or tours.size(0) <= batch_size:
+        return _run_post_revision_full(
+            tours,
+            revisers,
             get_cost_func,
-            reviser,
-            rl,
-            ri,
-            opts=opts,
-            shift_len=shift_len,
-            layer_id=layer_id + 1000,
+            opts,
+            post_revision_lens,
+            post_revision_iters,
             stats_list=stats_list,
         )
-        layer_elapsed = time.time() - start_time
 
-        cost_layer = (
-            (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1)
-            + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)
-        )
-        # width=1: best == avg == mean.
-        print(
-            "[POST Revisor L={:>4}] layer {}/{} done: "
-            "time={:6.2f}s, cost={:.4f}".format(
-                rl, layer_id + 1, len(revisers), layer_elapsed, cost_layer.mean().item()
-            )
-        )
-
-    costs_out = (
-        (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1)
-        + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)
+    # Chunk along dim 0; ceil-divide to cover the remainder.
+    n_chunks = (tours.size(0) + batch_size - 1) // batch_size
+    print(
+        f"[INFO] post-revision chunking: {tours.size(0)} instances "
+        f"into {n_chunks} chunks of up to {batch_size}"
     )
-    assert seed.shape == (seed.shape[0], problem_size, 2)
-    assert costs_out.shape == (seed.shape[0],)
-    return seed, costs_out
+    seed_chunks = []
+    cost_chunks = []
+    for i in range(n_chunks):
+        start = i * batch_size
+        end = min(start + batch_size, tours.size(0))
+        chunk_seed = tours[start:end]
+        chunk_seed_out, chunk_cost = _run_post_revision_full(
+            chunk_seed,
+            revisers,
+            get_cost_func,
+            opts,
+            post_revision_lens,
+            post_revision_iters,
+            stats_list=None,  # stats_list is only meaningful for the single-call path
+            chunk_id=i,
+            n_chunks=n_chunks,
+        )
+        seed_chunks.append(chunk_seed_out)
+        cost_chunks.append(chunk_cost)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return torch.cat(seed_chunks, dim=0), torch.cat(cost_chunks, dim=0)
 
 
 def reconnect(

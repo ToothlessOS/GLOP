@@ -16,7 +16,10 @@ from heatmap.cvrp.inst import sum_cost
 from utils.diagnosis import (
     check_no_self_intersection,
     check_convex_hull,
+    check_purity_order,
+    _summarize_purity_order,
     plot_tsp_tours,
+    plot_tsp_tours_purity,
     fix_intersections_via_2opt,
 )
 from utils.functions import run_post_revision, LCP_TSP, load_problem
@@ -38,7 +41,7 @@ def eval_dataset(dataset_path, opts):
         reviser.eval()
         reviser.set_decode_type(opts.decode_strategy)
 
-    results, duration, all_stats = _eval_dataset(
+    results, duration, all_stats, coords_for_dump = _eval_dataset(
         dataset_path, opts, opts.device, revisers
     )
 
@@ -93,7 +96,97 @@ def eval_dataset(dataset_path, opts):
 
     if opts.problem_type != "cvrp":
         tours = torch.cat(tours, dim=0)
-    return tours
+
+    # For non-TSP types there is no canonical `(val_size, N, 2)` coords
+    # tensor that maps cleanly to the GLOP tour positions; let the caller
+    # treat that as 'snapshot not applicable'. For CVRP/PCTSP, downstream
+    # comparison tooling targets tsp only.
+    if opts.problem_type != "tsp":
+        coords_for_dump = None
+
+    return tours, coords_for_dump
+
+
+def _save_tours_snapshot(out_dir, tag, stage, coords, tours, opts):
+    """Persist a per-stage GLOP-tour snapshot to disk for head-to-head use.
+
+    Writes ``<out_dir>/<tag>_<stage>.pt`` containing the original city
+    coordinates (in canonical .pkl order) and the tours reordered into
+    GLOP's traversal order, and updates ``<out_dir>/meta.json`` with one
+    entry per stage (cost statistics + which file holds the snapshot).
+
+    Args:
+        out_dir: target directory; created if missing.
+        tag: short identifier shared across stages — encodes the CLI
+            configuration (problem type/size, width, lens, iters).
+        stage: one of {"raw", "postfix", "postrev"}; used as the suffix
+            on the .pt file and as a key in meta.json.
+        coords: (M, N, 2) tensor — original city coordinates in .pkl
+            canonical order. May be None for non-TSP runs.
+        tours: (M, N, 2) tensor — GLOP tours at the current pipeline
+            stage; closed-loop costs are recomputed from this for the
+            meta.json summary statistics.
+        opts: argparse Namespace; persisted in meta.json so the
+            downstream compare_solvers.py knows exactly what produced
+            this dump.
+    """
+    import datetime
+    import json
+    import os
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    snap_path = os.path.join(out_dir, f"{tag}_{stage}.pt")
+    snap_payload = {
+        "stage": stage,
+        "coords": None if coords is None else coords.detach().cpu(),
+        "tours": tours.detach().cpu(),
+    }
+    torch.save(snap_payload, snap_path)
+
+    # Recompute closed-loop cost from the saved `tours` to keep
+    # meta.json consistent with what's on disk.
+    cost = (tours[:, 1:] - tours[:, :-1]).norm(p=2, dim=2).sum(1) + (
+        tours[:, 0] - tours[:, -1]
+    ).norm(p=2, dim=1)
+
+    meta_path = os.path.join(out_dir, "meta.json")
+    if os.path.isfile(meta_path):
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+    else:
+        meta = {
+            "tag": tag,
+            "problem_type": getattr(opts, "problem_type", "tsp"),
+            "problem_size": getattr(opts, "problem_size", None),
+            "val_size": getattr(opts, "val_size", None),
+            "width": getattr(opts, "width", None),
+            "revision_lens": list(getattr(opts, "revision_lens", [])),
+            "revision_iters": list(getattr(opts, "revision_iters", [])),
+            "decode_strategy": getattr(opts, "decode_strategy", "sampling"),
+            "seed": getattr(opts, "seed", None),
+            "dataset_path": getattr(opts, "path", ""),
+            "created_utc": datetime.datetime.utcnow().isoformat() + "Z",
+            "stages": {},
+        }
+
+    meta["stages"][stage] = {
+        "file": os.path.basename(snap_path),
+        "cost_mean": float(cost.mean().item()),
+        "cost_std": float(cost.std().item()),
+        "cost_min": float(cost.min().item()),
+        "cost_max": float(cost.max().item()),
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+    }
+
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(
+        f"[save_tours] {stage}: wrote {snap_path} "
+        f"(cost mean={cost.mean().item():.4f}, "
+        f"min={cost.min().item():.4f})"
+    )
 
 
 def _eval_dataset(dataset_path, opts, device, revisers):
@@ -152,6 +245,15 @@ def _eval_dataset(dataset_path, opts, device, revisers):
         opts.eval_batch_size = 1
 
     dataloader = DataLoader(dataset, batch_size=opts.eval_batch_size)
+
+    # Canonical, un-permuted city coordinates for downstream
+    # head-to-head comparison (utils/compare_solvers.py recovers the
+    # GLOP permutation by exact-match lookup against this tensor).
+    coords_for_dump = None
+    if opts.problem_type == "tsp":
+        coords_for_dump = torch.stack(
+            list(dataset.data)[: opts.val_size]
+        )  # (val_size, N, 2)
 
     problem = load_problem("tsp")
     get_cost_func = lambda input, pi: problem.get_costs(input, pi, return_local=True)
@@ -300,7 +402,7 @@ def _eval_dataset(dataset_path, opts, device, revisers):
 
     duration = time.time() - start
 
-    return results, duration, all_stats
+    return results, duration, all_stats, coords_for_dump
 
 
 def _aggregate_solver_curve(all_stats):
@@ -517,6 +619,14 @@ if __name__ == "__main__":
         "the same length as --post_revision_lens.",
     )
     parser.add_argument(
+        "--post_revision_batch_size",
+        type=int,
+        default=None,
+        help="Chunk size for the post-revision pass. If unset, the full "
+        "eval batch is processed in one shot. Set this to cap peak VRAM "
+        "when the post-revisor stack is memory-heavy.",
+    )
+    parser.add_argument(
         "--diagnose",
         dest="diagnose",
         action="store_true",
@@ -528,6 +638,16 @@ if __name__ == "__main__":
         dest="diagnose",
         action="store_false",
         help="Disable sub-TSP heuristic-validity diagnostics",
+    )
+    parser.add_argument(
+        "--save_tours",
+        type=str,
+        default="",
+        help="If set (a directory path), save GLOP final tours at every "
+        "available stage (raw, postfix, postrev) to this directory. "
+        "Each stage writes `<tag>_<stage>.pt` with `coords` and `tours` "
+        "tensors plus a `meta.json` index, for head-to-head comparison "
+        "with LKH-3 via utils/compare_solvers.py.",
     )
     opts = parser.parse_args()
 
@@ -564,7 +684,24 @@ if __name__ == "__main__":
 
     torch.manual_seed(opts.seed)
 
-    tours = eval_dataset(opts.path, opts)
+    tours, coords_for_dump = eval_dataset(opts.path, opts)
+
+    # Save tours at every available stage for head-to-head comparison
+    # with LKH-3 via utils/compare_solvers.py. The tag encodes the CLI
+    # configuration so multiple runs into the same --save_tours dir
+    # don't clobber each other.
+    save_dir = getattr(opts, "save_tours", "")
+    if save_dir and opts.problem_type == "tsp":
+        snapshot_tag = (
+            f"{opts.problem_type}{opts.problem_size}_w{opts.width}"
+            f"_lens{'-'.join(str(x) for x in opts.revision_lens)}"
+            f"_iters{'-'.join(str(x) for x in opts.revision_iters)}"
+        )
+        _save_tours_snapshot(
+            save_dir, snapshot_tag, "raw", coords_for_dump, tours, opts
+        )
+    else:
+        snapshot_tag = ""
 
     # NEW: Diagnosis on outputs (TSP only)
     if opts.problem_type == "tsp":
@@ -593,6 +730,49 @@ if __name__ == "__main__":
         print(convex_hull_results.shape)
         print(convex_hull_results)
 
+        # Purity-order diagnostics on the raw GLOP output batch.
+        # `tours` has shape (B, N, 2) in traversal order; check_purity_order
+        # returns a (B, N) per-edge tensor. The three summaries are
+        # aggregated across all B*N edges of the batch.
+        purity_order = check_purity_order(tours)
+        purity_summary = _summarize_purity_order(purity_order)
+        print("=== Purity-order diagnostics ===")
+        print(
+            f"  Mean purity order:                {purity_summary['mean_purity_order']:.4f}"
+        )
+        print(
+            f"  Fraction of 0-order pure edges:   {purity_summary['fraction_pure']:.4f}"
+        )
+        mpn = purity_summary["mean_purity_order_nonpure"]
+        mpn_str = f"{mpn:.4f}" if not math.isnan(mpn) else "n/a"
+        print(
+            f"  Mean purity order (K_p > 0 only): {mpn_str}"
+        )
+
+        # Purity-colored visualization. Plots ALL tours (capped at 16)
+        # with each edge colored by its scalar purity via a viridis
+        # gradient, so locally-optimal (low-purity) edges stand out
+        # against "interior" (high-purity) edges.
+        try:
+            out_path_purity = plot_tsp_tours_purity(
+                tours,
+                purity_order=purity_order,
+                has_intersection=has_intersection,
+                num_intersections=num_intersections,
+                intersection_results=intersection_results,
+                consistency=consistency,
+                out_dir="results",
+                tag=f"tsp{opts.problem_size}_w{opts.width}",
+            )
+            if out_path_purity is not None:
+                print(
+                    f"=== Purity-colored visualization saved to: {out_path_purity} ==="
+                )
+        except Exception as e:
+            print(
+                f"[plot_tsp_tours_purity] skipped due to error: {type(e).__name__}: {e}"
+            )
+
         # Visualize problematic tours (self-intersection and/or hull violation).
         try:
             out_path = plot_tsp_tours(
@@ -609,7 +789,28 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"[plot_tsp_tours] skipped due to error: {type(e).__name__}: {e}")
 
-        tours, fix_info = fix_intersections_via_2opt(tours, max_iter=20)
+        # 2-opt is pure inference (no parameters to update) and does
+        # in-place mutation of `tours`. Wrap in no_grad so the autograd
+        # graph is not retained through up to max_iter=20 outer
+        # iterations × ~2 check_no_self_intersection calls each.
+        with torch.no_grad():
+            tours, fix_info = fix_intersections_via_2opt(tours, max_iter=20)
+
+        print("""[POST] 2-opt finished: {iters_used} iterations, "
+            "{initial_intersections} initial crossings, "
+            "{final_intersections} final crossings.""".format(**fix_info))
+        print(
+            "[POST] Initial cost: {:.4f}, final cost: {:.4f}".format(
+                fix_info["initial_cost"].mean().item(),
+                fix_info["final_cost"].mean().item(),
+            )
+        )
+
+        # Snapshot `postfix` — tours after fix_intersections_via_2opt.
+        if save_dir and snapshot_tag:
+            _save_tours_snapshot(
+                save_dir, snapshot_tag, "postfix", coords_for_dump, tours, opts
+            )
 
         # === POST-PROCESSING: revisor re-warm-start on the fixed tours ===
         # Uses the standalone run_post_revision helper to drive additional
@@ -624,6 +825,12 @@ if __name__ == "__main__":
                     "--post_revision_lens and --post_revision_iters must "
                     "have the same length."
                 )
+
+            print(
+                "[INFO] Current VRAM usage: {:.2f} GB".format(
+                    torch.cuda.memory_allocated() / 1e9
+                )
+            )
 
             print(
                 f"[POST] loading {len(opts.post_revision_lens)} post-revisors: "
@@ -646,35 +853,68 @@ if __name__ == "__main__":
                 post_rev.set_decode_type(opts.decode_strategy)
                 post_revisers.append(post_rev)
 
+            print(
+                "[INFO] Current VRAM usage: {:.2f} GB".format(
+                    torch.cuda.memory_allocated() / 1e9
+                )
+            )
+
             problem = load_problem("tsp")
             get_cost_func = lambda input, pi: problem.get_costs(
                 input, pi, return_local=True
             )
 
-            cost_before = (
-                (tours[:, 1:] - tours[:, :-1]).norm(p=2, dim=2).sum(1)
-                + (tours[:, 0] - tours[:, -1]).norm(p=2, dim=1)
-            )
+            cost_before = (tours[:, 1:] - tours[:, :-1]).norm(p=2, dim=2).sum(1) + (
+                tours[:, 0] - tours[:, -1]
+            ).norm(p=2, dim=1)
 
-            tours, _ = run_post_revision(
-                tours=tours,
-                revisers=post_revisers,
-                get_cost_func=get_cost_func,
-                opts=opts,
-                post_revision_lens=opts.post_revision_lens,
-                post_revision_iters=opts.post_revision_iters,
-            )
+            # Wrap the post-revision pass in torch.no_grad() to mirror the
+            # original ``reconnect`` pass — without it, every revisor
+            # forward pass builds the autograd graph and roughly doubles
+            # peak VRAM during inference.
+            with torch.no_grad():
+                tours, _ = run_post_revision(
+                    tours=tours,
+                    revisers=post_revisers,
+                    get_cost_func=get_cost_func,
+                    opts=opts,
+                    post_revision_lens=opts.post_revision_lens,
+                    post_revision_iters=opts.post_revision_iters,
+                    batch_size=getattr(opts, "post_revision_batch_size", None),
+                )
 
-            cost_after = (
-                (tours[:, 1:] - tours[:, :-1]).norm(p=2, dim=2).sum(1)
-                + (tours[:, 0] - tours[:, -1]).norm(p=2, dim=1)
-            )
-            pct = 100.0 * (
-                cost_after.mean().item() / cost_before.mean().item() - 1.0
-            )
+            cost_after = (tours[:, 1:] - tours[:, :-1]).norm(p=2, dim=2).sum(1) + (
+                tours[:, 0] - tours[:, -1]
+            ).norm(p=2, dim=1)
+            pct = 100.0 * (cost_after.mean().item() / cost_before.mean().item() - 1.0)
             print(
                 f"[POST] revisor re-warm-start (layers="
                 f"{len(opts.post_revision_lens)}): "
                 f"cost {cost_before.mean().item():.4f} -> "
                 f"{cost_after.mean().item():.4f} ({pct:+.2f}%)"
             )
+
+            pct = 100.0 * (
+                cost_after.mean().item() / fix_info["initial_cost"].mean().item() - 1.0
+            )
+            print(
+                f"[POST] total perf gain: "
+                f"cost {fix_info['initial_cost'].mean().item():.4f} -> "
+                f"{cost_after.mean().item():.4f} ({pct:+.2f}%)"
+            )
+
+            # Snapshot `postrev` — tours after the optional revisor
+            # re-warm-start pass. The `postrev` file is intentionally
+            # distinct from `postfix` so downstream comparison can tell
+            # whether revisor re-warm-start helped or hurt the gap.
+            if save_dir and snapshot_tag:
+                _save_tours_snapshot(
+                    save_dir, snapshot_tag, "postrev", coords_for_dump, tours, opts
+                )
+
+            # Release post-revisor weights and allocator blocks now that
+            # the post-revision pass is done, so subsequent steps
+            # (visualization, plotting) start from a clean slate.
+            del post_revisers
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()

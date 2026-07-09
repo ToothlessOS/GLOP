@@ -21,6 +21,7 @@ Run from the repo root:
 import argparse
 import datetime
 import json
+import math
 import os
 import pickle
 import re
@@ -40,7 +41,13 @@ _PROJECT_ROOT = os.path.abspath(
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from utils.diagnosis import check_convex_hull, check_no_self_intersection  # noqa: E402
+from utils.diagnosis import (  # noqa: E402
+    check_convex_hull,
+    check_no_self_intersection,
+    check_purity_order,
+    _summarize_purity_order,
+    plot_tsp_tours_purity,
+)
 from utils.lkh import (  # noqa: E402
     calc_tsp_length,
     read_tsplib,
@@ -331,6 +338,38 @@ def evaluate_one_instance(
         n_pairs = int(n_pairs.item())
         si_ok = (not has_inter)
 
+    # Purity-order diagnostics on the LKH-3 tour. The (1, N, 2) tour
+    # tensor is treated as a single-instance batch; check_purity_order
+    # returns a (1, N) per-edge tensor and _summarize_purity_order
+    # aggregates it.
+    purity_order_lkh = check_purity_order(tour_coords)
+    purity_summary_lkh = _summarize_purity_order(purity_order_lkh)
+    mean_po = purity_summary_lkh["mean_purity_order"]
+    frac_pure = purity_summary_lkh["fraction_pure"]
+    mean_po_nonpure = purity_summary_lkh["mean_purity_order_nonpure"]
+    mean_po_nonpure_val = (
+        None
+        if (isinstance(mean_po_nonpure, float) and math.isnan(mean_po_nonpure))
+        else float(mean_po_nonpure)
+    )
+
+    # Per-instance purity-colored PNG inside the dataset workdir. File
+    # name is `tour_purity_<dataset>_inst<NNNN>.png`. Best-effort:
+    # any plotting failure is logged but does not fail the run.
+    try:
+        purity_png = plot_tsp_tours_purity(
+            tour_coords,
+            purity_order=purity_order_lkh,
+            has_intersection=has_inter,
+            num_intersections=n_inter,
+            consistency=hull_consistency,
+            out_dir=opts.workdir,
+            tag=name,
+        )
+    except Exception as e:
+        purity_png = None
+        print(f"[plot_tsp_tours_purity] {name} skipped: {type(e).__name__}: {e}")
+
     record.update(
         {
             "ok": True,
@@ -349,6 +388,10 @@ def evaluate_one_instance(
             "n_inter": n_inter,
             "si_frac": frac,
             "si_n_pairs": n_pairs,
+            "purity_mean": mean_po,
+            "purity_frac_pure": frac_pure,
+            "purity_mean_nonpure": mean_po_nonpure_val,
+            "purity_png": purity_png,
             "wall_s": wall,
         }
     )
@@ -407,6 +450,15 @@ def _aggregate(records: list[dict]) -> dict:
     our_costs = [r["our_cost"] for r in records if "our_cost" in r]
     lkh_costs = [r["lkh_cost"] for r in records if r.get("lkh_cost") is not None]
     walls = [r["wall_s"] for r in records if "wall_s" in r]
+    purity_means = [r["purity_mean"] for r in records if "purity_mean" in r]
+    purity_frac_pures = [
+        r["purity_frac_pure"] for r in records if "purity_frac_pure" in r
+    ]
+    purity_mean_nonpures = [
+        r["purity_mean_nonpure"]
+        for r in records
+        if r.get("purity_mean_nonpure") is not None
+    ]
     return {
         "n_total": n_total,
         "n_solved": n_solved,
@@ -419,6 +471,9 @@ def _aggregate(records: list[dict]) -> dict:
         "our_costs": our_costs,
         "lkh_costs": lkh_costs,
         "walls": walls,
+        "purity_means": purity_means,
+        "purity_frac_pures": purity_frac_pures,
+        "purity_mean_nonpures": purity_mean_nonpures,
     }
 
 
@@ -497,6 +552,17 @@ def _print_dataset_block(agg: dict) -> None:
         )
     if agg["n_total"] > 0:
         print(f"  Cost consistency:       {agg['n_cost_ok']}/{n_total} OK")
+    if agg.get("purity_means"):
+        pm = np.asarray(agg["purity_means"], dtype=np.float64)
+        pf = np.asarray(agg["purity_frac_pures"], dtype=np.float64)
+        line = (
+            f"  Purity order:           mean={pm.mean():.4f}, "
+            f"frac_pure={pf.mean():.4f}"
+        )
+        if agg.get("purity_mean_nonpures"):
+            pmn = np.asarray(agg["purity_mean_nonpures"], dtype=np.float64)
+            line += f", mean_nonpure={pmn.mean():.4f}"
+        print(line)
 
 
 def _print_grand_total(aggs: list, total_wall: float) -> None:
@@ -508,6 +574,14 @@ def _print_grand_total(aggs: list, total_wall: float) -> None:
     n_si_attempted = sum(a["n_si_attempted"] for a in aggs)
     n_si_skipped = sum(a["n_si_skipped"] for a in aggs)
     n_cost_ok = sum(a["n_cost_ok"] for a in aggs)
+    # Aggregate purity across all datasets' records.
+    purity_all = []
+    purity_frac_all = []
+    purity_nonpure_all = []
+    for a in aggs:
+        purity_all.extend(a.get("purity_means", []))
+        purity_frac_all.extend(a.get("purity_frac_pures", []))
+        purity_nonpure_all.extend(a.get("purity_mean_nonpures", []))
     print("\n" + "=" * 64)
     print(
         f"  Overall: {n_solved}/{n_total} solved ({n_failed} failed), "
@@ -521,6 +595,18 @@ def _print_grand_total(aggs: list, total_wall: float) -> None:
         f"           {n_cost_ok}/{n_total} cost-consistent. "
         f"Total wall: {total_wall:.1f}s."
     )
+    if purity_all:
+        pa = np.asarray(purity_all, dtype=np.float64)
+        pfa = np.asarray(purity_frac_all, dtype=np.float64)
+        line = (
+            f"           purity order: mean={pa.mean():.4f}, "
+            f"frac_pure={pfa.mean():.4f}"
+        )
+        if purity_nonpure_all:
+            pna = np.asarray(purity_nonpure_all, dtype=np.float64)
+            line += f", mean_nonpure={pna.mean():.4f}"
+        line += "."
+        print(line)
     print("=" * 64)
 
 

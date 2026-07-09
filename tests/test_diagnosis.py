@@ -24,7 +24,10 @@ import torch
 from utils.diagnosis import (
     check_convex_hull,
     check_no_self_intersection,
+    check_purity_order,
+    _summarize_purity_order,
     plot_tsp_tours,
+    plot_tsp_tours_purity,
 )
 
 
@@ -362,6 +365,175 @@ def _test_plot_tsp_tours_batched():
 
 
 # ---------------------------------------------------------------------------
+# check_purity_order
+# ---------------------------------------------------------------------------
+
+
+def _test_check_purity_order_square():
+    # CCW unit square: no third city lies inside any diameter circle,
+    # so every edge is pure (K_p = 0).
+    sq = torch.tensor(
+        [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
+        dtype=torch.float32,
+    )
+    po = check_purity_order(sq)
+    assert po.shape == (1, 4)
+    assert po.dtype == torch.int64
+    assert po.tolist() == [[0, 0, 0, 0]]
+
+
+def _test_check_purity_order_pentagon():
+    # Regular pentagon: the convex hull is the pentagon itself, so
+    # for every edge no third vertex lies inside the diameter circle.
+    pts = []
+    for k in range(5):
+        theta = 2 * math.pi * k / 5
+        pts.append([math.cos(theta), math.sin(theta)])
+    seeds = torch.tensor([pts], dtype=torch.float32)
+    po = check_purity_order(seeds)
+    assert po.shape == (1, 5)
+    assert po.tolist() == [[0, 0, 0, 0, 0]]
+
+
+def _test_check_purity_order_endpoints_excluded():
+    # Co-linear 3 points: (0,0) -> (2,0) -> (4,0). The middle node
+    # lies ON the diameter of every edge (dot product is exactly
+    # zero, not strictly negative), so the strict `<` test excludes
+    # it. For the 3-point case: edge 0 ((0,0)->(2,0)) and edge 1
+    # ((2,0)->(4,0)) have no third city inside their diameter
+    # circles → K_p = 0. Edge 2 ((4,0)->(0,0) wrap) has the middle
+    # node (2,0) inside its diameter circle → K_p = 1.
+    seeds = torch.tensor(
+        [[[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]]], dtype=torch.float32
+    )
+    po = check_purity_order(seeds)
+    assert po.tolist() == [[0, 0, 1]]
+
+
+def _test_check_purity_order_long_edge():
+    # 4 points: one very long edge plus two small interior points.
+    # Tour: (0,0) -> (100,0) -> (0.1,0.1) -> (0.2,0.2).
+    # The long edge (0,0)->(100,0) has the two small points inside
+    # its diameter circle → K_p = 2. The wrap edge (0.2,0.2)->(0,0)
+    # has the long tail (100,0) and (0.1,0.1) inside → K_p depends
+    # on geometry. Verified empirically: K_p = [2, 1, 0, 1].
+    seeds = torch.tensor(
+        [
+            [
+                [0.0, 0.0],
+                [100.0, 0.0],
+                [0.1, 0.1],
+                [0.2, 0.2],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    po = check_purity_order(seeds)
+    assert po.shape == (1, 4)
+    assert po.tolist() == [[2, 1, 0, 1]]
+
+
+def _test_check_purity_order_batched():
+    # Two tours in one batch: a CCW square (all pure) and a tour
+    # with a long edge (some non-pure edges).
+    sq = torch.tensor(
+        [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
+        dtype=torch.float32,
+    )
+    long_edge = torch.tensor(
+        [[[0.0, 0.0], [100.0, 0.0], [0.1, 0.1], [0.2, 0.2]]],
+        dtype=torch.float32,
+    )
+    seeds = torch.cat([sq, long_edge], dim=0)
+    po = check_purity_order(seeds)
+    assert po.shape == (2, 4)
+    assert po[0].tolist() == [0, 0, 0, 0]
+    # The long-edge fixture has at least one non-pure edge.
+    assert int(po[1].max().item()) >= 1
+
+
+# ---------------------------------------------------------------------------
+# _summarize_purity_order
+# ---------------------------------------------------------------------------
+
+
+def _test_summarize_purity_order_all_pure():
+    # All edges pure: fraction_pure = 1.0, mean_nonpure = NaN.
+    po = torch.zeros(2, 5, dtype=torch.int64)
+    s = _summarize_purity_order(po)
+    assert s["mean_purity_order"] == 0.0
+    assert s["fraction_pure"] == 1.0
+    assert math.isnan(s["mean_purity_order_nonpure"])
+
+
+def _test_summarize_purity_order_mixed():
+    # Hand-computed: total 10 edges, 5 are pure (K_p = 0).
+    # Sum = 0+1+0+2+0 + 3+0+1+0+4 = 11. Mean = 11/10 = 1.1.
+    # Nonpure edges: 1, 2, 3, 1, 4 → sum 11, count 5, mean = 11/5 = 2.2.
+    po = torch.tensor(
+        [[0, 1, 0, 2, 0], [3, 0, 1, 0, 4]],
+        dtype=torch.int64,
+    )
+    s = _summarize_purity_order(po)
+    # Tolerance is loose because the int tensor is cast to float32
+    # before aggregation, introducing ~1e-7 of roundoff.
+    assert abs(s["mean_purity_order"] - 1.1) < 1e-5
+    assert abs(s["fraction_pure"] - 0.5) < 1e-5
+    assert abs(s["mean_purity_order_nonpure"] - 11.0 / 5.0) < 1e-5
+
+
+def _test_summarize_purity_order_empty():
+    # Empty tensor: zero/NaN fallbacks.
+    po = torch.zeros(0, 0, dtype=torch.int64)
+    s = _summarize_purity_order(po)
+    assert s["mean_purity_order"] == 0.0
+    assert s["fraction_pure"] == 0.0
+    assert math.isnan(s["mean_purity_order_nonpure"])
+
+
+# ---------------------------------------------------------------------------
+# plot_tsp_tours_purity
+# ---------------------------------------------------------------------------
+
+
+def _test_plot_tsp_tours_purity_runs():
+    # 2-tour batch (one clean square, one figure-eight). The function
+    # always writes a PNG (it does not skip clean tours, unlike
+    # plot_tsp_tours).
+    sq = torch.tensor(
+        [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
+        dtype=torch.float32,
+    )
+    cross = torch.tensor(
+        [[[0.0, 0.0], [1.0, 1.0], [1.0, 0.0], [0.0, 1.0]]],
+        dtype=torch.float32,
+    )
+    seeds = torch.cat([sq, cross], dim=0)
+
+    with tempfile.TemporaryDirectory() as d:
+        path = plot_tsp_tours_purity(
+            seeds,
+            out_dir=d,
+            tag="purity_test",
+            max_plots=4,
+        )
+        assert path is not None
+        assert os.path.isfile(path)
+        assert path.endswith("tour_purity_purity_test.png")
+        assert os.path.getsize(path) > 1024
+
+
+def _test_plot_tsp_tours_purity_too_small():
+    # N < 3 → function should return None and not crash.
+    seeds = torch.zeros(1, 2, 2, dtype=torch.float32)
+    seeds[0, :, 0] = torch.arange(2, dtype=torch.float32)
+    with tempfile.TemporaryDirectory() as d:
+        path = plot_tsp_tours_purity(seeds, out_dir=d, tag="tiny")
+        assert path is None
+        assert os.listdir(d) == []  # nothing written
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -385,6 +557,16 @@ ALL_TESTS = [
     _test_plot_tsp_tours_hull_violation,
     _test_plot_tsp_tours_clean_skips,
     _test_plot_tsp_tours_batched,
+    _test_check_purity_order_square,
+    _test_check_purity_order_pentagon,
+    _test_check_purity_order_endpoints_excluded,
+    _test_check_purity_order_long_edge,
+    _test_check_purity_order_batched,
+    _test_summarize_purity_order_all_pure,
+    _test_summarize_purity_order_mixed,
+    _test_summarize_purity_order_empty,
+    _test_plot_tsp_tours_purity_runs,
+    _test_plot_tsp_tours_purity_too_small,
 ]
 
 
