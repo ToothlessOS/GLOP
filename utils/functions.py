@@ -10,6 +10,8 @@ import torch.nn.functional as F
 import math
 import time
 
+from utils.post_process import maybe_two_opt
+
 def load_problem(name):
     from problems import TSP, LOCAL
     problem = {
@@ -321,6 +323,10 @@ def LCP_TSP(
         if offset_seed is not None:
             seeds = torch.cat([seeds,offset_seed], dim=1)
 
+        # Optional: run 2-opt after each revisor iteration (per_iter mode).
+        if getattr(opts, 'use_2opt', False) and getattr(opts, 'two_opt_mode', 'final') == 'per_iter':
+            seeds = maybe_two_opt(seeds, opts)
+
         # NEW: per-iteration logging — closed-loop tour cost across all --width restarts
         cost_iter = (seeds[:, 1:] - seeds[:, :-1]).norm(p=2, dim=2).sum(1) \
                   + (seeds[:, 0] - seeds[:, -1]).norm(p=2, dim=1)
@@ -397,6 +403,12 @@ def reconnect(
             seed = seed.reshape(-1, opts.eval_batch_size, seed.shape[-2], 2)[cost_revised_minidx, torch.arange(opts.eval_batch_size)]
     assert cost_revised.shape == (opts.eval_batch_size,)
     assert seed.shape == (opts.eval_batch_size, problem_size, 2)
+
+    # Optional: run 2-opt once on the finished tour (final mode).
+    if getattr(opts, 'use_2opt', False) and getattr(opts, 'two_opt_mode', 'final') == 'final':
+        seed = maybe_two_opt(seed, opts)
+        cost_revised = (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1) \
+                     + (seed[:, 0] - seed[:, -1]).norm(p=2, dim=1)
 
     return seed, cost_revised
 

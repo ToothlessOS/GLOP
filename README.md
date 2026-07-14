@@ -83,6 +83,47 @@ To reduce the inference duration, try:
 --revision_iters 5 5 5
 ```
 
+#### 2-opt post-processing (optional)
+
+An optional, batched, GPU/CPU 2-opt local search (`utils/post_process.py`) can
+refine the GLOP tour. It is disabled by default and exposed through three flags
+on `main.py`:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--use_2opt` | off | Enable 2-opt post-processing. |
+| `--two_opt_mode {final, per_iter}` | `final` | `final`: run 2-opt **once** after the whole GLOP pipeline. `per_iter`: run 2-opt **after every revisor iteration**. |
+| `--two_opt_iters N` | `10` | Max number of 2-opt sweeps per invocation. |
+
+```bash
+# TSP100, one 2-opt pass at the end of the pipeline
+python main.py --problem_size 100 --revision_lens 50 20 --revision_iters 10 5 \
+    --width 4 --eval_batch_size 8 --val_size 8 --no_aug \
+    --use_2opt --two_opt_mode final --two_opt_iters 30
+
+# ... 2-opt after each revisor iteration instead
+python main.py ... --use_2opt --two_opt_mode per_iter
+```
+
+Notes:
+- Only positive-gain moves are applied, so 2-opt never worsens a tour.
+- The gain matrix is `O(B·N²)` in memory, so this targets small-to-moderate
+  problem sizes; very large instances may run out of memory.
+- On strong reviser configurations the GLOP tour is often already
+  2-opt-locally-optimal, so 2-opt yields little; its benefit is largest on
+  weaker/shorter reviser settings (fewer `--revision_iters`).
+
+**Comparison / visualization script.** `eval_2opt.py` runs the same instances
+under three configurations — baseline (no 2-opt), `final`, and `per_iter` — and
+reports the final performance plus a per-iteration convergence figure saved to
+`results/twoopt_compare_*.png`:
+
+```bash
+python eval_2opt.py --problem_size 500 --revision_lens 100 50 20 --revision_iters 20 25 5 \
+    --width 10 --eval_batch_size 16 --val_size 128 --decode_strategy greedy \
+    --two_opt_iters 10
+```
+
 #### For ATSP
 
 Please refer to `./eval_atsp/`
