@@ -9,6 +9,70 @@ from multiprocessing import Pool
 import torch.nn.functional as F
 import math
 import time
+from utils.diagnosis import check_purity_order
+
+
+def _purity_guided_initial_pos(seed, revision_len, shift_len):
+    """Compute the per-layer ``initial_pos`` rotation for the purity-guided
+    decomposition hook (used by both ``reconnect`` and
+    ``_run_post_revision_full``).
+
+    A sliding-window average is computed across the
+    ``check_purity_order(seed).sum(0)`` per-edge badness scores, with a
+    circular kernel of width ``revision_len // 2``. The argmax of the
+    averaged score is then converted into a column shift such that, after
+    the standard ``shift_len`` sweep inside ``LCP_TSP``, the
+    worst-averaged edge lands at index ``revision_len // 2`` of chunk 0.
+
+    The circular padding is **asymmetric** (``half_l = w // 2``,
+    ``half_r = (w - 1) // 2``) so the total padding is always ``w - 1`` and
+    the ``avg_pool1d`` output length is exactly ``N = seed.size(1)``
+    regardless of whether ``revision_len`` is even or odd. This is the
+    parity bug that symmetric-padding versions exhibited for
+    ``revision_len`` divisible by 4.
+
+    Args:
+        seed: ``(B, N, 2)`` tour tensor in traversal order; the closed loop
+            wraps from position ``N - 1`` back to ``0``. Per-edge purity
+            is computed on this tensor.
+        revision_len: revisor window size for this layer. Used as both the
+            sliding-window kernel width target (``revision_len // 2``) and
+            the chunk-centre offset in the returned column shift.
+        shift_len: per-layer stride used by ``decomposition()`` inside
+            ``LCP_TSP``. The rotation composes with this stride so the
+            worst edge ends up in the middle of the first chunk.
+
+    Returns:
+        Python int in ``[0, N)`` — the column shift to forward as
+        ``LCP_TSP(..., initial_pos=...)``. ``LCP_TSP`` treats
+        ``initial_pos == 0`` as a no-op, so callers can pass this
+        unconditionally.
+    """
+    N = seed.size(1)
+    # Cast to float32 — ``check_purity_order`` returns int64 (Long) and
+    # ``F.avg_pool1d`` only supports floating-point dtypes.
+    scores = check_purity_order(seed).sum(dim=0).float()  # (N,)
+    w = revision_len // 2
+    if w < 2:
+        # Degenerate kernel (revision_len <= 3): avg_pool1d would either
+        # be identity (w == 1) or invalid (w == 0). Falling back to plain
+        # argmax preserves the "find a bad edge" intent without the
+        # sliding-window smoothing.
+        loc = int(scores.argmax(dim=0).item())
+    else:
+        half_l = w // 2
+        half_r = (w - 1) // 2
+        parts = []
+        if half_l:
+            parts.append(scores[-half_l:])
+        parts.append(scores)
+        if half_r:
+            parts.append(scores[:half_r])
+        x_circ = torch.cat(parts, dim=0).view(1, 1, -1)  # (1, 1, N + w - 1)
+        scores_avg = F.avg_pool1d(x_circ, kernel_size=w, stride=1).view(-1)  # (N,)
+        loc = int(scores_avg.argmax(dim=0).item())
+        print("[DEBUG] Purity-based initial loc: ", loc)
+    return (loc - shift_len - (revision_len // 2)) % N
 
 
 def load_problem(name):
@@ -557,9 +621,68 @@ def LCP_TSP(
     revision_iter,
     opts,
     shift_len,
+    initial_pos: int = 0,
     layer_id=None,
     stats_list=None,
+    iter_log_path=None,
+    run_metadata=None,
 ):
+    """Run the GLOP sub-TSP revisor cascade for ``revision_iter`` iterations.
+
+    For each iteration: decompose the closed loop into ``revision_len``-sized
+    overlapping sub-tours, run the neural revisor on each, optionally apply
+    block-level (hypernode) 2-opt, compute the closed-loop tour cost across
+    all ``--width`` restarts, and emit a per-iter ``print()`` line. Returns
+    the final ``(batch_size, num_nodes, coordinate_dim)`` coordinate-ordered
+    tour tensor.
+
+    Optional side-effects:
+
+    - ``stats_list``: mutated in place with one ``{layer_id, iter_id, sum_best,
+      sum_avg, count}`` dict per iter (used by ``_aggregate_solver_curve``).
+    - ``iter_log_path``: path to a JSONL file. When set, one JSON object per
+      iter is appended after the existing per-iter print. The schema embeds
+      run-level metadata (problem_type, problem_size, val_size, width,
+      revision_lens, revision_iters, decode_strategy, seed, dataset_path,
+      tag, run_started_utc) on every line, so any single record is
+      self-describing. See ``--iter_cost_log`` in ``main.py`` and
+      ``scripts/plot_solver_curve.py``.
+    - ``run_metadata``: a flat dict of run-level fields to embed in every
+      JSONL record. When ``None``, only the per-iter fields are written.
+      Caller is responsible for building this dict from ``vars(opts)`` and
+      a UTC start timestamp (see ``main.py`` for the canonical construction).
+
+      Per-iter fields:
+        - ``ts``: ISO-8601 UTC timestamp at the moment the record was written.
+        - ``layer_id``, ``iter_id``: revisor-layer index and 0-indexed iter
+          within the layer (``layer_id + 1000`` is used for post-revision
+          layers to keep them out of the original namespace).
+        - ``revision_len``, ``revision_iter``: revisor window size and the
+          total iteration count for this layer.
+        - ``do_block_2opt``: whether ``_block_swap_two_opt`` was applied.
+        - ``best``, ``avg``: post-2-opt closed-loop tour cost (or the direct
+          revisor output when ``do_block_2opt=False``).
+        - ``cost_before_2opt_best``, ``cost_before_2opt_avg``: the
+          corresponding values before the 2-opt pass; absent when
+          ``do_block_2opt=False``.
+        - ``count``: number of tour instances aggregated into ``best``/``avg``.
+        - ``iter_elapsed_s``: cumulative wall-clock seconds since this
+          ``LCP_TSP`` call started, measured at the end of the iter.
+        - ``total_elapsed_s``: alias of ``iter_elapsed_s`` kept for clarity
+          in plotting scripts; both fields carry the same value today.
+
+    Args:
+        initial_pos: per-layer start-alignment rotation (default 0). When
+          > 0, rotates ``seeds`` by ``initial_pos`` columns once before the
+          iter loop, after which the existing ``shift_len`` sweep operates
+          on the rotated tour. Combined with ``shift_len``, places the
+          worst-purity edge at chunk index ``revision_len // 2`` (see
+          ``utils/diagnosis.py:check_purity_order`` and the
+          ``--purity_guided_decomp`` flag in ``main.py`` for the rotation
+          math). Pass ``0`` for the default behavior (no rotation; the
+          default path is bit-identical to pre-change behavior because the
+          tensor is not copied).
+    """
 
     batch_size, num_nodes, coordinate_dim = seeds.shape
     offset = num_nodes % revision_len
@@ -575,7 +698,35 @@ def LCP_TSP(
         if stats_list is not None:
             stats_list.append({"iter_id": -1, **diag})
 
+    # NEW: hoist loop-invariants out of the per-iter loop.
+    do_block_2opt = getattr(opts, "do_block_2opt", True)
+    block_swap_max_iter = getattr(opts, "block_swap_max_iter", 10)
+    # NEW: prepare the run-level metadata block that is embedded in every
+    # JSONL record. ``run_metadata`` is None for the in-memory / plot-from-
+    # stats_list path; when set, copy once so per-iter mutations don't leak
+    # between layers. Strip ``run_start_epoch_seconds`` from the embedded
+    # metadata — it is only used locally to compute ``total_elapsed_s``.
+    log_metadata = dict(run_metadata) if run_metadata else {}
+    run_start_epoch = log_metadata.pop("run_start_epoch_seconds", None)
+    log_fh = None
+    if iter_log_path:
+        # Append mode is safe across multiple LCP_TSP calls (e.g. multi-layer
+        # cascade + post-revision). Caller is responsible for choosing a path
+        # unique to this run (see ``snapshot_tag`` in ``main.py``).
+        log_fh = open(iter_log_path, "a", buffering=1)  # line-buffered
+
     layer_start = time.time()  # NEW: per-layer wall-clock start
+    last_iter_end = layer_start
+
+    # NEW: per-layer start-alignment rotation (purity-guided decomposition).
+    # Applied once before the iter loop so the existing shift_len sweep
+    # operates on the rotated tour. No-op when initial_pos == 0 — the
+    # default path is bit-identical to pre-change behavior because the
+    # tensor is not copied. See utils/diagnosis.py:check_purity_order and
+    # the rotation math in the implementation plan.
+    if initial_pos:
+        seeds = torch.cat([seeds[:, initial_pos:], seeds[:, :initial_pos]], dim=1)
+
     for i in range(revision_iter):
 
         decomposed_seeds, offset_seed = decomposition(
@@ -618,8 +769,6 @@ def LCP_TSP(
         cost_before_2opt = (seeds[:, 1:] - seeds[:, :-1]).norm(p=2, dim=2).sum(1) + (
             seeds[:, 0] - seeds[:, -1]
         ).norm(p=2, dim=1)
-        do_block_2opt = getattr(opts, "do_block_2opt", True)
-        block_swap_max_iter = getattr(opts, "block_swap_max_iter", 10)
         if do_block_2opt:
             seeds = _block_swap_two_opt(
                 seeds, revision_len, offset, max_iter=block_swap_max_iter
@@ -635,7 +784,20 @@ def LCP_TSP(
         )
 
         # NEW: per-iteration logging — closed-loop tour cost across all --width restarts
-        iter_elapsed = time.time() - layer_start
+        iter_end = time.time()
+        # ``total_elapsed_s`` is the cumulative wall-clock time since the
+        # start of the GLOP run (not since the start of this LCP_TSP call)
+        # so the value is monotonically non-decreasing across revisor
+        # layers and the optional post-revision pass. Falls back to the
+        # per-call layer time if the caller did not provide a run-start
+        # epoch (e.g. tests or ad-hoc callers that don't set up
+        # ``run_metadata``).
+        if run_start_epoch is not None:
+            total_elapsed_s = iter_end - run_start_epoch
+        else:
+            total_elapsed_s = iter_end - layer_start
+        iter_elapsed_s = iter_end - last_iter_end
+        last_iter_end = iter_end
         if do_block_2opt:
             print(
                 "[Revisor L={:>4}] iter {:>2}/{:>2}: best={:.4f}, avg={:.4f}, 2-opt Δavg={:+.4f}, 2-opt Δbest={:+.4f}, elapsed={:6.2f}s".format(
@@ -646,7 +808,7 @@ def LCP_TSP(
                     avg_after,
                     avg_after - avg_before,
                     best_after - best_before,
-                    iter_elapsed,
+                    total_elapsed_s,
                 )
             )
         else:
@@ -657,7 +819,7 @@ def LCP_TSP(
                     revision_iter,
                     best_after,
                     avg_after,
-                    iter_elapsed,
+                    total_elapsed_s,
                 )
             )
 
@@ -684,6 +846,37 @@ def LCP_TSP(
                     "count": count_after,
                 }
             )
+
+        # NEW: write a per-iter JSONL record. Schema is described in the
+        # function-level docstring. ``iter_end`` is the iter's finish time
+        # (used as the record timestamp), not the time of the next iter.
+        if log_fh is not None:
+            import datetime as _dt  # local import keeps the import graph small
+
+            record = {
+                "ts": _dt.datetime.now(_dt.timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "layer_id": layer_id,
+                "iter_id": i,
+                "revision_len": revision_len,
+                "revision_iter": revision_iter,
+                "do_block_2opt": bool(do_block_2opt),
+                "best": float(best_after),
+                "avg": float(avg_after),
+                "count": int(count_after),
+                "iter_elapsed_s": float(iter_elapsed_s),
+                "total_elapsed_s": float(total_elapsed_s),
+            }
+            if do_block_2opt:
+                record["cost_before_2opt_best"] = float(best_before)
+                record["cost_before_2opt_avg"] = float(avg_before)
+            # Embed run-level metadata on every line for self-describing JSONL.
+            record.update(log_metadata)
+            log_fh.write(json.dumps(record) + "\n")
+
+    if log_fh is not None:
+        log_fh.close()
     return seeds
 
 
@@ -697,6 +890,8 @@ def _run_post_revision_full(
     stats_list=None,
     chunk_id=None,
     n_chunks=None,
+    iter_log_path=None,
+    run_metadata=None,
 ):
     """Inner helper that drives the revisor stack over a single ``(B, N, 2)``
     seed without chunking. Used by :func:`run_post_revision` either directly
@@ -706,6 +901,10 @@ def _run_post_revision_full(
     autograd graph during inference (the original ``reconnect`` pass already
     does this), and calls ``torch.cuda.empty_cache()`` between layers to
     release accumulated allocator blocks.
+
+    ``iter_log_path`` and ``run_metadata`` are forwarded to each
+    ``LCP_TSP`` call so the optional per-iter JSONL sidecar covers
+    post-revision passes as well. See :func:`LCP_TSP` for the schema.
     """
     problem_size = seed.size(1)
 
@@ -737,6 +936,15 @@ def _run_post_revision_full(
 
         start_time = time.time()
         shift_len = max(rl // ri, 1)
+        # NEW: purity-guided decomposition (opt-in via --purity_guided_decomp).
+        # Uses the same sliding-average as ``reconnect`` so both the
+        # primary cascade and the post-revision cascade agree on the
+        # worst-purity neighbourhood. See
+        # :func:`_purity_guided_initial_pos` for the math.
+        initial_pos = 0
+        if getattr(opts, "purity_guided_decomp", False):
+            initial_pos = _purity_guided_initial_pos(seed, rl, shift_len)
+
         # layer_id + 1000 sentinel keeps post-revisor entries out of the
         # same (layer_id, iter_id) namespace as the original revisor.
         # Wrap in no_grad so we don't build the autograd graph during
@@ -751,8 +959,11 @@ def _run_post_revision_full(
                 ri,
                 opts=opts,
                 shift_len=shift_len,
+                initial_pos=initial_pos,  # NEW: purity-guided decomposition
                 layer_id=layer_id + 1000,
                 stats_list=stats_list,
+                iter_log_path=iter_log_path,  # NEW: forwarded to LCP_TSP
+                run_metadata=run_metadata,  # NEW: forwarded to LCP_TSP
             )
         # Release allocator-held blocks from this layer's activations
         # before the next layer's revisor forward pass allocates again.
@@ -793,6 +1004,8 @@ def run_post_revision(
     post_revision_iters,
     stats_list=None,
     batch_size=None,
+    iter_log_path=None,
+    run_metadata=None,
 ):
     """Treat ``tours`` (B, N, 2) as a warm-start seed and run additional
     revisor passes. Width is implicitly 1 (no width-axis reduction).
@@ -818,6 +1031,11 @@ def run_post_revision(
             concatenated. Lets users cap peak VRAM when the post-revisor
             stack is memory-heavy. Mirrors the
             :func:`utils.tensor_functions.compute_in_batches` pattern.
+        iter_log_path: optional JSONL path; forwarded to every
+            :func:`LCP_TSP` call. See :func:`LCP_TSP` for the schema.
+        run_metadata: optional dict; forwarded to every :func:`LCP_TSP`
+            call so the post-revision pass uses the same run-level
+            metadata as the original revisor.
 
     Returns:
         (tours_out, costs_out) with shapes ``(B, N, 2)`` and ``(B,)``.
@@ -838,6 +1056,8 @@ def run_post_revision(
             post_revision_lens,
             post_revision_iters,
             stats_list=stats_list,
+            iter_log_path=iter_log_path,  # NEW: forwarded to LCP_TSP
+            run_metadata=run_metadata,  # NEW: forwarded to LCP_TSP
         )
 
     # Chunk along dim 0; ceil-divide to cover the remainder.
@@ -862,6 +1082,8 @@ def run_post_revision(
             stats_list=None,  # stats_list is only meaningful for the single-call path
             chunk_id=i,
             n_chunks=n_chunks,
+            iter_log_path=iter_log_path,  # NEW: forwarded to LCP_TSP
+            run_metadata=run_metadata,  # NEW: forwarded to LCP_TSP
         )
         seed_chunks.append(chunk_seed_out)
         cost_chunks.append(chunk_cost)
@@ -876,7 +1098,19 @@ def reconnect(
     opts,
     revisers,
     stats_list=None,
+    iter_log_path=None,
+    run_metadata=None,
 ):
+    """Run the full revisor stack: for each revisor layer, call
+    :func:`LCP_TSP` once with the layer's ``revision_len`` and
+    ``revision_iter`` count. Returns ``(seed, cost_revised)`` after the
+    optional ``--no_prune`` width-axis reduction.
+
+    ``iter_log_path`` and ``run_metadata`` are forwarded to every
+    :func:`LCP_TSP` call so the optional per-iter JSONL sidecar
+    (``--iter_cost_log`` in ``main.py``) covers all layers of the
+    cascade. See :func:`LCP_TSP` for the record schema.
+    """
     seed = batch
     problem_size = seed.size(1)
     if len(revisers) == 0:
@@ -902,6 +1136,22 @@ def reconnect(
         shift_len = max(
             opts.revision_lens[revision_id] // opts.revision_iters[revision_id], 1
         )
+
+        # NEW: Purity-guided decomposition (opt-in via --purity_guided_decomp).
+        # Sum purity scores across the batch and rotate the tour so the
+        # worst-averaged edge lands at index ``revision_len // 2`` of
+        # chunk 0 after the existing ``shift_len`` rotation. See
+        # :func:`_purity_guided_initial_pos` for the sliding-average math
+        # and ``LCP_TSP`` for the rotation contract. Zero cost when the
+        # flag is off.
+        initial_pos = 0
+        if getattr(opts, "purity_guided_decomp", False):
+            initial_pos = _purity_guided_initial_pos(
+                seed,
+                opts.revision_lens[revision_id],
+                shift_len,
+            )
+
         seed = LCP_TSP(
             seed,
             get_cost_func,
@@ -910,8 +1160,11 @@ def reconnect(
             opts.revision_iters[revision_id],
             opts=opts,
             shift_len=shift_len,
+            initial_pos=initial_pos,  # NEW: purity-guided decomposition
             layer_id=revision_id,
             stats_list=stats_list,
+            iter_log_path=iter_log_path,  # NEW: forwarded to LCP_TSP
+            run_metadata=run_metadata,  # NEW: forwarded to LCP_TSP
         )
         cost_revised = (seed[:, 1:] - seed[:, :-1]).norm(p=2, dim=2).sum(1) + (
             seed[:, 0] - seed[:, -1]

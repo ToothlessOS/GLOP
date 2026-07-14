@@ -25,7 +25,7 @@ from utils.diagnosis import (
 from utils.functions import run_post_revision, LCP_TSP, load_problem
 
 
-def eval_dataset(dataset_path, opts):
+def eval_dataset(dataset_path, opts, run_metadata=None):
     pp.pprint(vars(opts))
 
     revisers = []
@@ -41,8 +41,16 @@ def eval_dataset(dataset_path, opts):
         reviser.eval()
         reviser.set_decode_type(opts.decode_strategy)
 
+    # NEW: forward --iter_cost_log + run_metadata to the per-batch helper so
+    # ``LCP_TSP`` (via ``reconnect``) can append the per-iter JSONL sidecar.
+    iter_log_path = getattr(opts, "iter_cost_log", "")
     results, duration, all_stats, coords_for_dump = _eval_dataset(
-        dataset_path, opts, opts.device, revisers
+        dataset_path,
+        opts,
+        opts.device,
+        revisers,
+        iter_log_path=iter_log_path,
+        run_metadata=run_metadata,
     )
 
     costs, costs_revised, costs_revised_with_penalty, costs_warm_avg, tours = zip(
@@ -189,7 +197,9 @@ def _save_tours_snapshot(out_dir, tag, stage, coords, tours, opts):
     )
 
 
-def _eval_dataset(dataset_path, opts, device, revisers):
+def _eval_dataset(
+    dataset_path, opts, device, revisers, iter_log_path=None, run_metadata=None
+):
     start = time.time()
     if opts.problem_type == "tsp":
         dataset = revisers[0].problem.make_dataset(
@@ -322,6 +332,8 @@ def _eval_dataset(dataset_path, opts, device, revisers):
                 opts=opts,
                 revisers=revisers,
                 stats_list=all_stats,
+                iter_log_path=iter_log_path,  # NEW: forwarded to LCP_TSP
+                run_metadata=run_metadata,  # NEW: forwarded to LCP_TSP
             )
 
             # === POST-PROCESSING: fix self-intersections via direct 2-opt ===
@@ -432,65 +444,6 @@ def _aggregate_solver_curve(all_stats):
         out[lid] = {"iters": iters, "best": best, "avg": avg}
     return out
 
-
-"""
-def plot_solver_curve(all_stats, opts):
-    # Plot avg/best cost per iteration for each revisor layer.
-    import os
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    agg = _aggregate_solver_curve(all_stats)
-    if not agg:
-        return
-
-    layers = sorted(agg.keys())
-    n_layers = len(layers)
-    fig, axes = plt.subplots(1, n_layers, figsize=(5 * n_layers, 4.5), sharey=True)
-    if n_layers == 1:
-        axes = [axes]
-    colors = plt.cm.viridis([i / max(n_layers - 1, 1) for i in range(n_layers)])
-
-    for ax, lid, color in zip(axes, layers, colors):
-        data = agg[lid]
-        x = [it + 1 for it in data['iters']]
-        # Always plot both curves, even when they overlap (e.g. post-prune width=1).
-        ax.plot(x, data['avg'], '--', color=color, linewidth=2.0,
-                marker='o', markersize=5, label='avg across --width')
-        ax.plot(x, data['best'], '-', color=color, linewidth=2.0,
-                marker='s', markersize=5, label='best across --width')
-        ax.set_title(f'Layer {lid + 1}: L={opts.revision_lens[lid]} '
-                     f'({opts.revision_iters[lid]} iters)')
-        ax.set_xlabel('Iteration within layer')
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc='best', fontsize=8)
-        # Annotate first and last values
-        if data['best']:
-            ax.annotate(f"{data['best'][0]:.3f}", xy=(x[0], data['best'][0]),
-                        xytext=(3, 5), textcoords='offset points', fontsize=8,
-                        color=color)
-            ax.annotate(f"{data['best'][-1]:.3f}", xy=(x[-1], data['best'][-1]),
-                        xytext=(-25, 5), textcoords='offset points', fontsize=8,
-                        color=color)
-
-    axes[0].set_ylabel('Closed-loop tour cost\n(eval-dataset mean)')
-    fig.suptitle(f'GLOP sub-TSP solver convergence — '
-                 f'{opts.problem_type}{opts.problem_size}, width={opts.width}, val_size={opts.val_size}',
-                 fontsize=11)
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.85)
-
-    out_dir = 'results'
-    os.makedirs(out_dir, exist_ok=True)
-    tag = (f"{opts.problem_type}{opts.problem_size}_w{opts.width}"
-           f"_lens{'-'.join(str(x) for x in opts.revision_lens)}"
-           f"_iters{'-'.join(str(x) for x in opts.revision_iters)}")
-    out_path = os.path.join(out_dir, f'solver_curve_{tag}.png')
-    fig.savefig(out_path, dpi=120)
-    plt.close(fig)
-    print(f"=== Solver curve saved to: {out_path} ===")
-"""
 
 if __name__ == "__main__":
 
@@ -649,6 +602,33 @@ if __name__ == "__main__":
         "tensors plus a `meta.json` index, for head-to-head comparison "
         "with LKH-3 via utils/compare_solvers.py.",
     )
+    parser.add_argument(
+        "--iter_cost_log",
+        type=str,
+        default="",
+        help="Path to a JSONL sidecar that records per-iter closed-loop "
+        "tour cost from LCP_TSP. One JSON object per line. Each record "
+        "contains per-iter fields (layer_id, iter_id, revision_len, "
+        "best, avg, do_block_2opt, cost_before_2opt_best/avg when "
+        "applicable, iter_elapsed_s, total_elapsed_s) plus run-level "
+        "metadata (problem_type, problem_size, val_size, width, "
+        "revision_lens, revision_iters, decode_strategy, seed, "
+        "dataset_path, tag, run_started_utc). Visualize with "
+        "`python scripts/plot_solver_curve.py <path>`. "
+        "Empty (default) disables logging.",
+    )
+    parser.add_argument(
+        "--purity_guided_decomp",
+        dest="purity_guided_decomp",
+        action="store_true",
+        default=False,
+        help="Rotate the input tour so the edge with the highest purity score "
+        "(see utils/diagnosis.py:check_purity_order) lands at index "
+        "revision_len // 2 of the first revisor chunk. This places the "
+        "most problematic region in the middle of a subproblem so the "
+        "revisor's first pass attacks it directly. Computed once per "
+        "revisor layer; default: off (no rotation, original behavior).",
+    )
     opts = parser.parse_args()
 
     use_cuda = torch.cuda.is_available() and not opts.no_cuda
@@ -684,7 +664,44 @@ if __name__ == "__main__":
 
     torch.manual_seed(opts.seed)
 
-    tours, coords_for_dump = eval_dataset(opts.path, opts)
+    # NEW: build the run-level metadata block that is embedded on every
+    # line of the --iter_cost_log JSONL sidecar. The schema is a superset
+    # of the meta.json fields written by _save_tours_snapshot (problem_type,
+    # problem_size, val_size, width, revision_lens, revision_iters,
+    # decode_strategy, seed, dataset_path) plus the run tag and UTC
+    # start timestamp. Constructed once in __main__ so that both the
+    # pre-revision and post-revision LCP_TSP calls see the same values.
+    import datetime as _dt
+
+    snapshot_tag = (
+        f"{opts.problem_type}{opts.problem_size}_w{opts.width}"
+        f"_lens{'-'.join(str(x) for x in opts.revision_lens)}"
+        f"_iters{'-'.join(str(x) for x in opts.revision_iters)}"
+    )
+    run_metadata = {
+        "problem_type": opts.problem_type,
+        "problem_size": opts.problem_size,
+        "val_size": opts.val_size,
+        "width": opts.width,
+        "revision_lens": list(opts.revision_lens),
+        "revision_iters": list(opts.revision_iters),
+        "decode_strategy": opts.decode_strategy,
+        "seed": opts.seed,
+        "dataset_path": opts.path,
+        "tag": snapshot_tag,
+        "run_started_utc": _dt.datetime.now(_dt.timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        # NEW: epoch seconds at run start. LCP_TSP uses this to compute
+        # ``total_elapsed_s`` (cumulative wall-clock time since the GLOP
+        # run began, not since the current LCP_TSP call started) so the
+        # per-iter JSONL records and the plot's suptitle can report a
+        # single, monotonically increasing "total time" across all
+        # revisor layers and the optional post-revision pass.
+        "run_start_epoch_seconds": time.time(),
+    }
+
+    tours, coords_for_dump = eval_dataset(opts.path, opts, run_metadata=run_metadata)
 
     # Save tours at every available stage for head-to-head comparison
     # with LKH-3 via utils/compare_solvers.py. The tag encodes the CLI
@@ -692,16 +709,9 @@ if __name__ == "__main__":
     # don't clobber each other.
     save_dir = getattr(opts, "save_tours", "")
     if save_dir and opts.problem_type == "tsp":
-        snapshot_tag = (
-            f"{opts.problem_type}{opts.problem_size}_w{opts.width}"
-            f"_lens{'-'.join(str(x) for x in opts.revision_lens)}"
-            f"_iters{'-'.join(str(x) for x in opts.revision_iters)}"
-        )
         _save_tours_snapshot(
             save_dir, snapshot_tag, "raw", coords_for_dump, tours, opts
         )
-    else:
-        snapshot_tag = ""
 
     # NEW: Diagnosis on outputs (TSP only)
     if opts.problem_type == "tsp":
@@ -745,9 +755,7 @@ if __name__ == "__main__":
         )
         mpn = purity_summary["mean_purity_order_nonpure"]
         mpn_str = f"{mpn:.4f}" if not math.isnan(mpn) else "n/a"
-        print(
-            f"  Mean purity order (K_p > 0 only): {mpn_str}"
-        )
+        print(f"  Mean purity order (K_p > 0 only): {mpn_str}")
 
         # Purity-colored visualization. Plots ALL tours (capped at 16)
         # with each edge colored by its scalar purity via a viridis
@@ -881,6 +889,8 @@ if __name__ == "__main__":
                     post_revision_lens=opts.post_revision_lens,
                     post_revision_iters=opts.post_revision_iters,
                     batch_size=getattr(opts, "post_revision_batch_size", None),
+                    iter_log_path=getattr(opts, "iter_cost_log", ""),
+                    run_metadata=run_metadata,
                 )
 
             cost_after = (tours[:, 1:] - tours[:, :-1]).norm(p=2, dim=2).sum(1) + (

@@ -29,6 +29,7 @@ from utils.diagnosis import (
     plot_tsp_tours,
     plot_tsp_tours_purity,
 )
+from utils.functions import _purity_guided_initial_pos
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +454,55 @@ def _test_check_purity_order_batched():
 
 
 # ---------------------------------------------------------------------------
+# _purity_guided_initial_pos (purity-guided decomposition)
+# ---------------------------------------------------------------------------
+
+
+def _test_purity_guided_initial_pos_shape_parity():
+    """The sliding-average block must produce a Python int in [0, N) for
+    every parity of ``revision_len`` — including the multiples-of-4 cases
+    (e.g. 20, 40, 100, 200) that exhibit the off-by-one bug under the
+    symmetric ``half = w // 2`` padding.
+
+    Regression target for utils/functions.py:_purity_guided_initial_pos:
+    asymmetric padding ``half_l = w // 2``, ``half_r = (w - 1) // 2``
+    yields ``avg_pool1d`` output length N for all w, so the helper
+    returns a column shift in ``[0, N)``.
+    """
+    torch.manual_seed(0)
+    # (1, N, 2) — a single 50-city tour (not necessarily optimal, just
+    # a closed loop the helper can score).
+    N = 50
+    pts = torch.rand(1, N, 2, dtype=torch.float32)
+    shift_len = 5
+    for rl in (1, 20, 30, 40, 50, 100, 200):
+        pos = _purity_guided_initial_pos(pts, revision_len=rl, shift_len=shift_len)
+        assert isinstance(pos, int), (
+            f"revision_len={rl}: expected int, got {type(pos)}"
+        )
+        assert 0 <= pos < N, (
+            f"revision_len={rl}: initial_pos={pos} not in [0, {N})"
+        )
+
+
+def _test_purity_guided_initial_pos_no_window():
+    """For ``revision_len < 4`` (``w = revision_len // 2 < 2``), the
+    sliding-average kernel is degenerate (w == 0 or w == 1 = identity).
+    The helper must gracefully fall back to plain argmax and still
+    return a valid column shift in ``[0, N)``.
+    """
+    pts = torch.rand(1, 50, 2, dtype=torch.float32)
+    for rl in (1, 2, 3):
+        pos = _purity_guided_initial_pos(pts, revision_len=rl, shift_len=1)
+        assert isinstance(pos, int), (
+            f"revision_len={rl}: expected int, got {type(pos)}"
+        )
+        assert 0 <= pos < 50, (
+            f"revision_len={rl}: initial_pos={pos} not in [0, 50)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # _summarize_purity_order
 # ---------------------------------------------------------------------------
 
@@ -562,6 +612,8 @@ ALL_TESTS = [
     _test_check_purity_order_endpoints_excluded,
     _test_check_purity_order_long_edge,
     _test_check_purity_order_batched,
+    _test_purity_guided_initial_pos_shape_parity,
+    _test_purity_guided_initial_pos_no_window,
     _test_summarize_purity_order_all_pure,
     _test_summarize_purity_order_mixed,
     _test_summarize_purity_order_empty,

@@ -306,3 +306,8 @@ LKH-3: python LKH3_eval/run_diagnosis.py
   `docs/LOCAL_CONSTRUCTION.md`.
 - For the GLOP-vs-LKH edge-diff comparison (which uses the same
   per-tour plotting primitives), see `utils/compare_solvers.py`.
+- For **purity-guided decomposition** — using `check_purity_order` to
+  align the revisor's first chunk window with the worst-purity edge —
+  see `--purity_guided_decomp` in `main.py` and the "Purity-Guided
+  Decomposition" section of `README.md`. The flag is opt-in (default
+  off, bit-identical to pre-change behavior when absent).
