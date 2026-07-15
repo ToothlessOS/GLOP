@@ -308,6 +308,16 @@ if __name__ == "__main__":
                              "'per_iter' runs it after each revisor iteration")
     parser.add_argument('--two_opt_iters', type=int, default=10,
                         help='Max number of 2-opt sweeps per invocation')
+    parser.add_argument('--two_opt_kind', type=str, default='full',
+                        choices=['full', 'knn'],
+                        help="2-opt algorithm variant: 'full' (dense candidate set) "
+                             "or 'knn' (k-NN-sparse; uses --two_opt_knn_k)")
+    parser.add_argument('--two_opt_knn_k', type=int, default=20,
+                        help='k for KNN-sparse 2-opt (only used when --two_opt_kind=knn)')
+    parser.add_argument('--two_opt_debug', action='store_true',
+                        help='Print per-sweep 2-opt phase timings to stdout '
+                             '(knn_graph construction, candidate extraction, '
+                             'apply loop, gather, etc.) for perf investigation.')
     opts = parser.parse_args()
 
     use_cuda = torch.cuda.is_available() and not opts.no_cuda

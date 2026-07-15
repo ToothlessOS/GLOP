@@ -38,6 +38,64 @@ After| 1.89 (8.2s) | 2.04 (9.3s) | 2.33 (15s)
 - tqdm
 - [random-insertion](https://github.com/Furffico/random-insertion)>=0.3.0
 
+ToothlessOS Notes: My replication env info for reference (see requirements.txt):
+
+Refer to Pytorch documentation for cuda support
+
+`pyg-lib`, `torch-scatter` and `torch-sparse` need to be installed from: https://data.pyg.org/whl/torch-1.13.0%2Bcu117.html
+
+```
+aiohappyeyeballs==2.6.2
+aiohttp==3.14.1
+aiosignal==1.4.0
+async-timeout==5.0.1
+attrs==26.1.0
+certifi==2026.6.17
+charset-normalizer==3.4.7
+contourpy==1.3.2
+cycler==0.12.1
+exceptiongroup==1.3.1
+fonttools==4.63.0
+frozenlist==1.8.0
+fsspec==2026.6.0
+idna==3.18
+iniconfig==2.3.0
+Jinja2==3.1.6
+joblib==1.5.3
+kiwisolver==1.5.0
+MarkupSafe==3.0.3
+matplotlib==3.10.9
+multidict==6.7.1
+numpy==1.23.5
+packaging==26.0
+pillow==12.3.0
+pluggy==1.6.0
+propcache==0.5.2
+psutil==7.2.2
+pyg-lib==0.4.0+pt113cu117
+Pygments==2.20.0
+pyparsing==3.3.2
+pytest==9.1.1
+python-dateutil==2.9.0.post0
+random-insertion==0.3.0.post1
+requests==2.34.2
+ruff==0.15.20
+scikit-learn==1.7.2
+scipy==1.15.3
+six==1.17.0
+threadpoolctl==3.6.0
+tomli==2.4.1
+torch==1.13.0+cu117
+torch-scatter==2.1.1+pt113cu117
+torch-sparse==0.6.17+pt113cu117
+torch_geometric==2.5.0
+tqdm==4.68.3
+typing_extensions==4.15.0
+urllib3==2.7.0
+xxhash==3.8.0
+yarl==1.24.2
+```
+
 ---
 
 ## How to Use
@@ -86,42 +144,54 @@ To reduce the inference duration, try:
 #### 2-opt post-processing (optional)
 
 An optional, batched, GPU/CPU 2-opt local search (`utils/post_process.py`) can
-refine the GLOP tour. It is disabled by default and exposed through three flags
+refine the GLOP tour. It is disabled by default and exposed through five flags
 on `main.py`:
 
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--use_2opt` | off | Enable 2-opt post-processing. |
-| `--two_opt_mode {final, per_iter}` | `final` | `final`: run 2-opt **once** after the whole GLOP pipeline. `per_iter`: run 2-opt **after every revisor iteration**. |
+| `--two_opt_kind {full, knn}` | `full` | `full`: dense candidate set (`O(B·N²)` gain matrix). `knn`: k-nearest-neighbour-sparse candidates (`O(B·N·k)`); recommended for larger `N`. |
+| `--two_opt_mode {final, per_iter}` | `final` | `final`: run 2-opt **once** after the whole GLOP pipeline. `per_iter`: run 2-opt **after every revisor iteration**. Composes orthogonally with `--two_opt_kind`. |
 | `--two_opt_iters N` | `10` | Max number of 2-opt sweeps per invocation. |
+| `--two_opt_knn_k K` | `20` | Number of nearest neighbours per node in the KNN-sparse variant (only used when `--two_opt_kind=knn`). |
+| `--two_opt_debug` | off | Print per-sweep 2-opt phase timings (`knn`, `gather`, `distance`, `apply_loop`, `reorder`, …) to stdout. Use to profile KNN-vs-full performance. |
 
 ```bash
-# TSP100, one 2-opt pass at the end of the pipeline
+# TSP100, one full 2-opt pass at the end of the pipeline
 python main.py --problem_size 100 --revision_lens 50 20 --revision_iters 10 5 \
     --width 4 --eval_batch_size 8 --val_size 8 --no_aug \
-    --use_2opt --two_opt_mode final --two_opt_iters 30
+    --use_2opt --two_opt_kind full --two_opt_mode final --two_opt_iters 30
 
 # ... 2-opt after each revisor iteration instead
 python main.py ... --use_2opt --two_opt_mode per_iter
+
+# ... KNN-sparse 2-opt for larger instances (e.g. TSP500/1000)
+python main.py ... --use_2opt --two_opt_kind knn --two_opt_knn_k 20 --two_opt_iters 10
 ```
 
 Notes:
 - Only positive-gain moves are applied, so 2-opt never worsens a tour.
-- The gain matrix is `O(B·N²)` in memory, so this targets small-to-moderate
-  problem sizes; very large instances may run out of memory.
+- `full` 2-opt materialises an `O(B·N²)` gain matrix and targets small-to-moderate
+  problem sizes (`N ≲ 500`). For larger `N` use `--two_opt_kind knn`: both the
+  candidate set and the per-edge distance computation scale as `O(B·N·k)`.
+- The KNN graph is computed via `torch_geometric.nn.knn_graph` when its
+  `pyg-lib` backend is available, with a transparent fallback to
+  `scipy.spatial.cKDTree` (no `pyg-lib` dependency required).
 - On strong reviser configurations the GLOP tour is often already
   2-opt-locally-optimal, so 2-opt yields little; its benefit is largest on
   weaker/shorter reviser settings (fewer `--revision_iters`).
 
 **Comparison / visualization script.** `eval_2opt.py` runs the same instances
-under three configurations — baseline (no 2-opt), `final`, and `per_iter` — and
-reports the final performance plus a per-iteration convergence figure saved to
-`results/twoopt_compare_*.png`:
+under five configurations — baseline (no 2-opt), `final`, `per_iter`,
+`knn_final`, and `knn_per_iter` — and reports the final performance plus a
+per-iteration convergence figure saved to `results/twoopt_compare_*.png`. Each
+row's `kind` column shows the algorithm variant; the figure's title and
+filename suffix the kind when KNN modes are present.
 
 ```bash
-python eval_2opt.py --problem_size 500 --revision_lens 100 50 20 --revision_iters 20 25 5 \
+python eval_2opt.py --problem_size 500 --revision_lens 100 50 20 --revision_iters 8 10 5 \
     --width 10 --eval_batch_size 16 --val_size 128 --decode_strategy greedy \
-    --two_opt_iters 10
+    --two_opt_iters 100 --two_opt_knn_k 25
 ```
 
 #### For ATSP
