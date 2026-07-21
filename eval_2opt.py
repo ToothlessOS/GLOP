@@ -1,13 +1,19 @@
 """Evaluate and compare GLOP with 2-opt post-processing.
 
-Runs the SAME TSP instances through five configurations and reports both the
+Runs the SAME TSP instances through several configurations and reports both the
 final tour cost and the per-iteration convergence of each:
 
-  1. baseline     — GLOP only (no 2-opt)
-  2. final        — GLOP, then full 2-opt once at the end of the pipeline
-  3. per_iter     — GLOP with full 2-opt applied after every revisor iteration
-  4. knn_final    — GLOP, then KNN-sparse 2-opt once at the end
-  5. knn_per_iter — GLOP with KNN-sparse 2-opt applied after every revisor iter
+  1. baseline            — GLOP only (no 2-opt)
+  2. final               — GLOP, then full 2-opt once at the end of the pipeline
+  3. per_iter            — GLOP with full 2-opt applied after every revisor iter
+  4. knn_final           — GLOP, then KNN-sparse 2-opt once at the end
+  5. knn_per_iter        — GLOP with KNN-sparse 2-opt after every revisor iter
+  6. radius_final        — GLOP, then tour-position-radius 2-opt at the end
+  7. radius_per_iter     — GLOP with tour-position-radius 2-opt per iter
+  8. range_final         — GLOP, then range-radius 2-opt with [2, 5] at the end
+  9. range_per_iter      — GLOP with range-radius 2-opt [2, 5] per iter
+ 10. range_wide_final    — GLOP, then range-radius 2-opt [2, N//10] at the end
+ 11. range_wide_per_iter — GLOP with range-radius 2-opt [2, N//10] per iter
 
 Outputs:
   * a printed summary table of final performance (avg / best cost, duration)
@@ -35,6 +41,7 @@ import numpy as np
 import torch
 
 from utils import load_model
+
 # Reuse the exact eval machinery from main.py so this script tracks the pipeline.
 from main import _eval_dataset, _aggregate_solver_curve
 
@@ -46,13 +53,13 @@ def _is_oom_error(exc):
     (skip the mode, keep evaluating the rest) or let it propagate.
     """
     # CUDA OOM, available as a distinct subclass since PyTorch 1.13.
-    oom_cls = getattr(torch.cuda, 'OutOfMemoryError', None)
+    oom_cls = getattr(torch.cuda, "OutOfMemoryError", None)
     if oom_cls is not None and isinstance(exc, oom_cls):
         return True
     # Some CUDA OOMs surface as a plain RuntimeError on older / custom builds.
     if isinstance(exc, RuntimeError):
         msg = str(exc).lower()
-        if 'cuda out of memory' in msg or 'out of memory' in msg:
+        if "cuda out of memory" in msg or "out of memory" in msg:
             return True
     # CPU OOM (numpy.memmap etc.).
     if isinstance(exc, MemoryError):
@@ -60,8 +67,18 @@ def _is_oom_error(exc):
     return False
 
 
-def _safe_run_mode(label, use_2opt, two_opt_mode, two_opt_kind, two_opt_knn_k,
-                   base_opts, revisers):
+def _safe_run_mode(
+    label,
+    use_2opt,
+    two_opt_mode,
+    two_opt_kind,
+    two_opt_knn_k,
+    two_opt_radius,
+    two_opt_radius_min,
+    two_opt_radius_max,
+    base_opts,
+    revisers,
+):
     """Run one configuration; on OOM, return a sentinel row instead of raising.
 
     Returns the same dict shape as ``run_mode`` with two extra keys:
@@ -72,8 +89,18 @@ def _safe_run_mode(label, use_2opt, two_opt_mode, two_opt_kind, two_opt_knn_k,
     propagated untouched.
     """
     try:
-        return run_mode(label, use_2opt, two_opt_mode, two_opt_kind,
-                        two_opt_knn_k, base_opts, revisers)
+        return run_mode(
+            label,
+            use_2opt,
+            two_opt_mode,
+            two_opt_kind,
+            two_opt_knn_k,
+            two_opt_radius,
+            two_opt_radius_min,
+            two_opt_radius_max,
+            base_opts,
+            revisers,
+        )
     except BaseException as exc:
         if not _is_oom_error(exc):
             raise
@@ -84,34 +111,118 @@ def _safe_run_mode(label, use_2opt, two_opt_mode, two_opt_kind, two_opt_knn_k,
             except Exception:
                 pass
         print(
-            f'\n[ERROR] OOM in mode={label} '
-            f'(kind={two_opt_kind}, knn_k={two_opt_knn_k}); '
-            f'skipping this mode. error={exc!r}\n',
+            f"\n[ERROR] OOM in mode={label} "
+            f"(kind={two_opt_kind}, knn_k={two_opt_knn_k}, "
+            f"radius={two_opt_radius}, "
+            f"r_min={two_opt_radius_min}, r_max={two_opt_radius_max}); "
+            f"skipping this mode. error={exc!r}\n",
             flush=True,
         )
         return {
-            'label': label,
-            'two_opt_kind': two_opt_kind,
-            'two_opt_knn_k': two_opt_knn_k,
-            'avg': float('nan'),
-            'best': float('nan'),
-            'duration': float('nan'),
-            'curve': {},
-            'skipped': True,
-            'error': str(exc),
+            "label": label,
+            "two_opt_kind": two_opt_kind,
+            "two_opt_knn_k": two_opt_knn_k,
+            "two_opt_radius": two_opt_radius,
+            "two_opt_radius_min": two_opt_radius_min,
+            "two_opt_radius_max": two_opt_radius_max,
+            "avg": float("nan"),
+            "best": float("nan"),
+            "duration": float("nan"),
+            "curve": {},
+            "swap_dists": [],
+            "skipped": True,
+            "error": str(exc),
         }
 
 
-# Modes to compare: (label, use_2opt, two_opt_mode, two_opt_kind, two_opt_knn_k)
-MODES = [
-    ('baseline',     False, 'final',    'full', 20),
-    ('final',        True,  'final',    'full', 20),
-    ('per_iter',     True,  'per_iter', 'full', 20),
-    ('knn_final',    True,  'final',    'knn',  20),
-    ('knn_per_iter', True,  'per_iter', 'knn',  20),
-]
+# Modes to compare:
+# (label, use_2opt, two_opt_mode, two_opt_kind,
+#  two_opt_knn_k, two_opt_radius, two_opt_radius_min, two_opt_radius_max)
+#
+# ``two_opt_radius`` is only consulted when ``two_opt_kind == 'radius'``;
+# ``None`` makes the dispatcher fall back to ``max(2, N // 10)`` per instance.
+# ``two_opt_radius_min`` / ``two_opt_radius_max`` are only consulted when
+# ``two_opt_kind == 'range_radius'``; ``None`` for either makes the dispatcher
+# fall back to ``(2, max(2, N // 10))``.
+def make_modes(opts):
+    """Build the comparison table once ``opts.problem_size`` is known.
+
+    The wide-window range-radius rows scale with the instance size, so the
+    MODES table is built per-call rather than at module load.
+
+    Returns a list of 8-tuples, one per comparison row. Each tuple has the
+    following positional fields:
+
+      0. ``label`` (str) — short name shown in the printed summary table,
+         figure legend, swap-distance histogram, and used as the filename
+         tag component. Must be unique across rows. The ``print_table``
+         helper also infers the ``two_opt_kind`` from the label prefix:
+         ``knn_*`` → ``knn``, ``range_*`` → ``range_radius``,
+         ``radius_*`` → ``radius``, anything else → ``full``.
+
+      1. ``use_2opt`` (bool) — master switch. When ``False`` the pipeline
+         skips the optional 2-opt step entirely (this is the GLOP-only
+         baseline). When ``True``, the pipeline invokes the variant
+         selected by ``two_opt_kind``.
+
+      2. ``two_opt_mode`` (``'final'`` | ``'per_iter'``) — controls *when*
+         the 2-opt runs. ``'final'`` runs it once after the whole revisor
+         chain; ``'per_iter'`` runs it after every revisor iteration.
+
+      3. ``two_opt_kind`` (``'full'`` | ``'knn'`` | ``'radius'`` |
+         ``'range_radius'``) — selects the algorithm. Unknown values
+         trigger a ``UserWarning`` and fall back to ``'full'``.
+
+      4. ``two_opt_knn_k`` (int | None) — ``k`` for KNN-sparse 2-opt.
+         Only consulted when ``two_opt_kind == 'knn'``. ``None`` means the
+         dispatcher uses its default (currently 20).
+
+      5. ``two_opt_radius`` (int | None) — ``r`` for fixed-radius
+         tour-position 2-opt. Only consulted when ``two_opt_kind ==
+         'radius'``. ``None`` means the dispatcher falls back to
+         ``max(2, N // 10)`` per instance.
+
+      6. ``two_opt_radius_min`` (int | None) — inclusive lower bound of
+         the offset window for ``two_opt_kind == 'range_radius'``. Only
+         consulted for range-radius rows. ``None`` means the dispatcher
+         falls back to ``2``. Must be ``>= 2`` if supplied (offsets 0
+         and ±1 are invalid 2-opt moves).
+
+      7. ``two_opt_radius_max`` (int | None) — inclusive upper bound of
+         the offset window for ``two_opt_kind == 'range_radius'``. Only
+         consulted for range-radius rows. ``None`` means the dispatcher
+         falls back to ``max(2, N // 10)``. If the dispatcher finds
+         ``r_min > r_max`` it emits a ``UserWarning`` and silently swaps
+         the two values.
+
+    Downstream consumers all read rows positionally, so any change here is
+    the only edit needed to add / remove / retune a comparison row:
+
+      * ``colors`` / ``markers`` dicts in ``plot_comparison`` and
+        ``plot_swap_distance_histograms`` colour-code each label (new
+        labels fall back to matplotlib's default cycle if absent).
+      * ``_build_tag`` and the figure suptitle suffix append a
+        ``kind=`` / ``k=`` / ``r=`` / ``r=[min,max]`` suffix derived from
+        ``opts.two_opt_kind``.
+    """
+    N = max(2, opts.problem_size // 10)  # problem_size_based
+    C = max(2, opts.revision_lens[0])
+    return [
+        # ("baseline", False, "final", "full", 20, None, None, None),
+        # ("final", True, "final", "full", 20, None, None, None),
+        # ("per_iter", True, "per_iter", "full", 20, None, None, None),
+        # ("knn_final", True, "final", "knn", 20, None, None, None),
+        # ("knn_per_iter", True, "per_iter", "knn", 20, None, None, None),
+        # ("radius_final", True, "final", "radius", 20, None, 0.5 * C, 1.5 * C),
+        ("radius_per_iter", True, "per_iter", "radius", 20, None, 0.5 * N, 2 * N),
+        # ("range_final", True, "final", "range_radius", 20, None, N, 3 * N),
+        # ("range_per_iter", True, "per_iter", "range_radius", 20, None, N, 3 * N),
+    ]
+
+
 # Each row's `use_2opt` flags whether the pipeline invokes the optional 2-opt
-# step; `two_opt_kind` selects full vs. knn in `maybe_two_opt` (post_process.py).
+# step; `two_opt_kind` selects full vs. knn vs. radius vs. range_radius in
+# ``maybe_two_opt`` (post_process.py).
 
 
 def build_base_opts():
@@ -119,59 +230,122 @@ def build_base_opts():
 
     Field names mirror main.py so the reused pipeline code finds what it needs.
     """
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--problem_size', type=int, default=100)
-    p.add_argument('--problem_type', type=str, default='tsp', choices=['tsp'],
-                   help='This comparison script targets TSP.')
-    p.add_argument('--path', type=str, default='',
-                   help='Test dataset path; defaults to data/tsp/tsp<size>_test.pkl')
-    p.add_argument('--val_size', type=int, default=8)
-    p.add_argument('--eval_batch_size', type=int, default=8)
-    p.add_argument('--width', type=int, default=4)
-    p.add_argument('--revision_lens', nargs='+', type=int, default=[50, 20])
-    p.add_argument('--revision_iters', nargs='+', type=int, default=[10, 5])
-    p.add_argument('--decode_strategy', type=str, default='greedy',
-                   help="'greedy' recommended for a deterministic comparison")
-    p.add_argument('--two_opt_iters', type=int, default=30,
-                   help='Max 2-opt sweeps per invocation (final and per_iter modes)')
-    p.add_argument('--two_opt_kind', type=str, default='full',
-                   choices=['full', 'knn'],
-                   help="2-opt algorithm variant: 'full' (dense) or "
-                        "'knn' (k-NN-sparse; uses --two_opt_knn_k)")
-    p.add_argument('--two_opt_knn_k', type=int, default=20,
-                   help='k for KNN-sparse 2-opt (only used when --two_opt_kind=knn)')
-    p.add_argument('--two_opt_debug', action='store_true',
-                   help='Print per-sweep 2-opt phase timings to stdout for '
-                        'performance investigation.')
-    p.add_argument('--no_aug', action='store_true')
-    p.add_argument('--no_prune', action='store_true')
-    p.add_argument('--no_progress_bar', action='store_true')
-    p.add_argument('--no_cuda', action='store_true')
-    p.add_argument('--device_id', type=int, default=0)
-    p.add_argument('--seed', type=int, default=1)
-    p.add_argument('--out_dir', type=str, default='results')
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--problem_size", type=int, default=100)
+    p.add_argument(
+        "--problem_type",
+        type=str,
+        default="tsp",
+        choices=["tsp"],
+        help="This comparison script targets TSP.",
+    )
+    p.add_argument(
+        "--path",
+        type=str,
+        default="",
+        help="Test dataset path; defaults to data/tsp/tsp<size>_test.pkl",
+    )
+    p.add_argument("--val_size", type=int, default=8)
+    p.add_argument("--eval_batch_size", type=int, default=8)
+    p.add_argument("--width", type=int, default=4)
+    p.add_argument("--revision_lens", nargs="+", type=int, default=[50, 20])
+    p.add_argument("--revision_iters", nargs="+", type=int, default=[10, 5])
+    p.add_argument(
+        "--decode_strategy",
+        type=str,
+        default="greedy",
+        help="'greedy' recommended for a deterministic comparison",
+    )
+    p.add_argument(
+        "--two_opt_iters",
+        type=int,
+        default=30,
+        help="Max 2-opt sweeps per invocation (final and per_iter modes)",
+    )
+    p.add_argument(
+        "--two_opt_kind",
+        type=str,
+        default="full",
+        choices=["full", "knn", "radius", "range_radius"],
+        help="2-opt algorithm variant: 'full' (dense), "
+        "'knn' (k-NN-sparse; uses --two_opt_knn_k), "
+        "'radius' (tour-position-sparse; uses --two_opt_radius), "
+        "or 'range_radius' (tour-position-sparse over "
+        "[r_min, r_max]; uses --two_opt_radius_min / "
+        "--two_opt_radius_max)",
+    )
+    p.add_argument(
+        "--two_opt_knn_k",
+        type=int,
+        default=20,
+        help="k for KNN-sparse 2-opt (only used when --two_opt_kind=knn)",
+    )
+    p.add_argument(
+        "--two_opt_radius",
+        type=int,
+        default=None,
+        help="r for radius-sparse 2-opt (only used when "
+        "--two_opt_kind=radius). Default: 10%% of "
+        "--problem_size (floored at 2).",
+    )
+    p.add_argument(
+        "--two_opt_radius_min",
+        type=int,
+        default=2,
+        help="r_min for range-radius 2-opt (only used when "
+        "--two_opt_kind=range_radius). Default: 2.",
+    )
+    p.add_argument(
+        "--two_opt_radius_max",
+        type=int,
+        default=None,
+        help="r_max for range-radius 2-opt (only used when "
+        "--two_opt_kind=range_radius). Default: 10%% of "
+        "--problem_size (floored at max(r_min, 2)).",
+    )
+    p.add_argument(
+        "--two_opt_debug",
+        action="store_true",
+        help="Print per-sweep 2-opt phase timings to stdout for "
+        "performance investigation.",
+    )
+    p.add_argument(
+        "--record_two_opt_swaps",
+        action="store_true",
+        help="Record |i_star - j_star| for every accepted 2-opt "
+        "move and emit a swap-distance histogram PNG "
+        "(results/twoopt_swap_dists_<tag>.png).",
+    )
+    p.add_argument("--no_aug", action="store_true")
+    p.add_argument("--no_prune", action="store_true")
+    p.add_argument("--no_progress_bar", action="store_true")
+    p.add_argument("--no_cuda", action="store_true")
+    p.add_argument("--device_id", type=int, default=0)
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--out_dir", type=str, default="results")
 
     opts = p.parse_args()
 
     # Fields the reused pipeline reads but this CLI does not expose.
     opts.n_subset = 1
     opts.n_partition = 1
-    opts.ckpt_path = ''
+    opts.ckpt_path = ""
     opts.tsp_aug = False  # _eval_dataset may flip this for problem_size <= 100
 
     use_cuda = torch.cuda.is_available() and not opts.no_cuda
-    opts.device = torch.device(f'cuda:{opts.device_id}' if use_cuda else 'cpu')
+    opts.device = torch.device(f"cuda:{opts.device_id}" if use_cuda else "cpu")
 
-    if opts.path == '':
-        opts.path = f'data/tsp/tsp{opts.problem_size}_test.pkl'
+    if opts.path == "":
+        opts.path = f"data/tsp/tsp{opts.problem_size}_test.pkl"
     return opts
 
 
 def load_revisers(opts):
     revisers = []
     for reviser_size in opts.revision_lens:
-        reviser_path = f'pretrained/Reviser-stage2/reviser_{reviser_size}/epoch-299.pt'
+        reviser_path = f"pretrained/Reviser-stage2/reviser_{reviser_size}/epoch-299.pt"
         reviser, _ = load_model(reviser_path, is_local=True)
         reviser.to(opts.device)
         reviser.eval()
@@ -186,34 +360,61 @@ def final_costs(results):
     return costs_revised
 
 
-def run_mode(label, use_2opt, two_opt_mode, two_opt_kind, two_opt_knn_k,
-              base_opts, revisers):
+def run_mode(
+    label,
+    use_2opt,
+    two_opt_mode,
+    two_opt_kind,
+    two_opt_knn_k,
+    two_opt_radius,
+    two_opt_radius_min,
+    two_opt_radius_max,
+    base_opts,
+    revisers,
+):
     """Run one configuration on a fresh copy of opts with a reset RNG."""
     opts = copy.deepcopy(base_opts)
     opts.use_2opt = use_2opt
     opts.two_opt_mode = two_opt_mode
     opts.two_opt_kind = two_opt_kind
     opts.two_opt_knn_k = two_opt_knn_k
-    opts.two_opt_debug = getattr(base_opts, 'two_opt_debug', False)
+    opts.two_opt_radius = two_opt_radius
+    opts.two_opt_radius_min = two_opt_radius_min
+    opts.two_opt_radius_max = two_opt_radius_max
+    opts.two_opt_debug = getattr(base_opts, "two_opt_debug", False)
+    opts.record_two_opt_swaps = getattr(base_opts, "record_two_opt_swaps", False)
+    # Always allocate a sink so downstream code can read it unconditionally;
+    # the actual recording inside full_2opt / knn_2opt is gated on the flag.
+    swap_dists: list = []
+    opts.two_opt_swap_sink = swap_dists
 
     # Reset RNG so every mode sees identical warm-start tours / sampling draws.
     torch.manual_seed(base_opts.seed)
     np.random.seed(base_opts.seed)
 
-    print(f'\n===================== running mode: {label} '
-          f'(use_2opt={use_2opt}, mode={two_opt_mode}, '
-          f'kind={two_opt_kind}, knn_k={two_opt_knn_k}) =====================')
+    print(
+        f"\n===================== running mode: {label} "
+        f"(use_2opt={use_2opt}, mode={two_opt_mode}, "
+        f"kind={two_opt_kind}, knn_k={two_opt_knn_k}, "
+        f"radius={two_opt_radius}, "
+        f"r_min={two_opt_radius_min}, r_max={two_opt_radius_max}) "
+        f"====================="
+    )
     results, duration, all_stats = _eval_dataset(opts.path, opts, opts.device, revisers)
 
     costs = final_costs(results)
     return {
-        'label': label,
-        'two_opt_kind': two_opt_kind,
-        'two_opt_knn_k': two_opt_knn_k,
-        'avg': costs.mean().item(),
-        'best': costs.min().item(),
-        'duration': duration,
-        'curve': _aggregate_solver_curve(all_stats),  # {layer_id: {iters,best,avg}}
+        "label": label,
+        "two_opt_kind": two_opt_kind,
+        "two_opt_knn_k": two_opt_knn_k,
+        "two_opt_radius": two_opt_radius,
+        "two_opt_radius_min": two_opt_radius_min,
+        "two_opt_radius_max": two_opt_radius_max,
+        "avg": costs.mean().item(),
+        "best": costs.min().item(),
+        "duration": duration,
+        "curve": _aggregate_solver_curve(all_stats),  # {layer_id: {iters,best,avg}}
+        "swap_dists": swap_dists,
     }
 
 
@@ -229,7 +430,7 @@ def flatten_curve(curve):
         data = curve[lid]
         if gx > 0:
             boundaries.append(gx + 0.5)
-        for b in data['best']:
+        for b in data["best"]:
             gx += 1
             xs.append(gx)
             ys.append(b)
@@ -238,97 +439,345 @@ def flatten_curve(curve):
 
 def plot_comparison(runs, opts):
     import matplotlib
-    matplotlib.use('Agg')
+
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     colors = {
-        'baseline':     '#7f7f7f',
-        'final':        '#1f77b4',
-        'per_iter':     '#d62728',
-        'knn_final':    '#2ca02c',
-        'knn_per_iter': '#9467bd',
+        "baseline": "#7f7f7f",
+        "final": "#1f77b4",
+        "per_iter": "#d62728",
+        "knn_final": "#2ca02c",
+        "knn_per_iter": "#9467bd",
+        "radius_final": "#ff7f0e",
+        "radius_per_iter": "#8c564b",
+        "range_final": "#e377c2",
+        "range_per_iter": "#bcbd22",
+        "range_wide_final": "#17becf",
+        "range_wide_per_iter": "#9edae5",
     }
     markers = {
-        'baseline':     'o',
-        'final':        's',
-        'per_iter':     '^',
-        'knn_final':    'D',
-        'knn_per_iter': 'v',
+        "baseline": "o",
+        "final": "s",
+        "per_iter": "^",
+        "knn_final": "D",
+        "knn_per_iter": "v",
+        "radius_final": "P",
+        "radius_per_iter": "X",
+        "range_final": "p",
+        "range_per_iter": "h",
+        "range_wide_final": "<",
+        "range_wide_per_iter": ">",
     }
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5),
-                                   gridspec_kw={'width_ratios': [2, 1]})
+    fig, (ax1, ax2) = plt.subplots(
+        1, 2, figsize=(13, 5), gridspec_kw={"width_ratios": [2, 1]}
+    )
 
     # --- Panel 1: per-iteration convergence ---
     all_boundaries = []
     max_x = 0
     for r in runs:
-        xs, ys, boundaries = flatten_curve(r['curve'])
+        xs, ys, boundaries = flatten_curve(r["curve"])
         if not xs:
             continue
         all_boundaries = boundaries  # same layout across modes
         max_x = max(max_x, xs[-1])
-        ax1.plot(xs, ys, '-', color=colors[r['label']], marker=markers[r['label']],
-                 markersize=4, linewidth=1.8, label=f"{r['label']} (per-iter)")
+        ax1.plot(
+            xs,
+            ys,
+            "-",
+            color=colors[r["label"]],
+            marker=markers[r["label"]],
+            markersize=4,
+            linewidth=1.8,
+            label=f"{r['label']} (per-iter)",
+        )
         # Terminal marker = the mode's FINAL cost after the whole pipeline
         # (captures the end-of-pipeline 2-opt drop for the 'final' mode).
-        ax1.plot([xs[-1], xs[-1] + 1], [ys[-1], r['avg']], ':',
-                 color=colors[r['label']], linewidth=1.2)
-        ax1.scatter([xs[-1] + 1], [r['avg']], color=colors[r['label']],
-                    marker='*', s=130, zorder=5)
+        ax1.plot(
+            [xs[-1], xs[-1] + 1],
+            [ys[-1], r["avg"]],
+            ":",
+            color=colors[r["label"]],
+            linewidth=1.2,
+        )
+        ax1.scatter(
+            [xs[-1] + 1],
+            [r["avg"]],
+            color=colors[r["label"]],
+            marker="*",
+            s=130,
+            zorder=5,
+        )
 
     for bx in all_boundaries:
-        ax1.axvline(bx, color='k', linestyle=':', alpha=0.25)
-    ax1.set_xlabel('Global revisor iteration (layers concatenated;  ★ = final cost)')
-    ax1.set_ylabel('Mean tour cost over eval set\n(best across --width)')
-    ax1.set_title('Cost at every iteration')
+        ax1.axvline(bx, color="k", linestyle=":", alpha=0.25)
+    ax1.set_xlabel("Global revisor iteration (layers concatenated;  ★ = final cost)")
+    ax1.set_ylabel("Mean tour cost over eval set\n(best across --width)")
+    ax1.set_title("Cost at every iteration")
     ax1.grid(True, alpha=0.3)
-    ax1.legend(loc='best', fontsize=9)
+    ax1.legend(loc="best", fontsize=9)
 
     # --- Panel 2: final performance bar chart ---
-    labels = [r['label'] for r in runs]
-    avgs = [r['avg'] for r in runs]
-    bests = [r['best'] for r in runs]
-    base_avg = next((r['avg'] for r in runs if r['label'] == 'baseline'), avgs[0])
+    labels = [r["label"] for r in runs]
+    avgs = [r["avg"] for r in runs]
+    bests = [r["best"] for r in runs]
+    base_avg = next((r["avg"] for r in runs if r["label"] == "baseline"), avgs[0])
     x = np.arange(len(labels))
     bars = ax2.bar(x, avgs, color=[colors[l] for l in labels], alpha=0.85)
     ax2.set_xticks(x)
     ax2.set_xticklabels(labels)
-    ax2.set_ylabel('Final mean tour cost')
-    ax2.set_title('Final performance')
-    ax2.grid(True, axis='y', alpha=0.3)
+    ax2.set_ylabel("Final mean tour cost")
+    ax2.set_title("Final performance")
+    ax2.grid(True, axis="y", alpha=0.3)
     lo = min(avgs) * 0.995
     hi = max(avgs) * 1.005
     ax2.set_ylim(lo, hi)
-    for xi, (bar, avg, best) in enumerate(zip(bars, avgs, bests)):
+    for xi, (_, avg, best) in enumerate(zip(bars, avgs, bests)):
         impr = 100.0 * (base_avg - avg) / base_avg if base_avg else 0.0
-        ax2.annotate(f"avg {avg:.3f}\nbest {best:.3f}\n({impr:+.2f}%)",
-                     xy=(xi, avg), xytext=(0, 3), textcoords='offset points',
-                     ha='center', va='bottom', fontsize=8)
+        ax2.annotate(
+            f"avg {avg:.3f}\nbest {best:.3f}\n({impr:+.2f}%)",
+            xy=(xi, avg),
+            xytext=(0, 3),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
 
-    has_knn = any(r['label'].startswith('knn') for r in runs)
+    has_knn = any(r["label"].startswith("knn") for r in runs)
+    has_radius = any(r["label"].startswith("radius") for r in runs)
+    has_range = any(r["label"].startswith("range") for r in runs)
     kind_suffix = (
-        f", kind={opts.two_opt_kind}" + (f", k={opts.two_opt_knn_k}" if opts.two_opt_kind == 'knn' else "")
-        if has_knn else ""
+        f", kind={opts.two_opt_kind}"
+        + (f", k={opts.two_opt_knn_k}" if opts.two_opt_kind == "knn" else "")
+        + (
+            f", r={opts.two_opt_radius}"
+            if (
+                opts.two_opt_kind == "radius"
+                and getattr(opts, "two_opt_radius", None) is not None
+            )
+            else ""
+        )
+        + (
+            f", r=[{getattr(opts, 'two_opt_radius_min', 2)},"
+            f"{getattr(opts, 'two_opt_radius_max', None)}]"
+            if (
+                opts.two_opt_kind == "range_radius"
+                and getattr(opts, "two_opt_radius_min", None) is not None
+                and getattr(opts, "two_opt_radius_max", None) is not None
+            )
+            else ""
+        )
+        if (has_knn or has_radius or has_range)
+        else ""
     )
     fig.suptitle(
         f"GLOP + 2-opt comparison — tsp{opts.problem_size}, width={opts.width}, "
         f"val_size={opts.val_size}, lens={opts.revision_lens}, iters={opts.revision_iters}, "
-        f"2opt_iters={opts.two_opt_iters}{kind_suffix}", fontsize=11)
+        f"2opt_iters={opts.two_opt_iters}{kind_suffix}",
+        fontsize=11,
+    )
     fig.tight_layout()
     fig.subplots_adjust(top=0.88)
 
     os.makedirs(opts.out_dir, exist_ok=True)
-    has_knn = any(r['label'].startswith('knn') for r in runs)
+    has_knn = any(r["label"].startswith("knn") for r in runs)
+    has_radius = any(r["label"].startswith("radius") for r in runs)
+    has_range = any(r["label"].startswith("range") for r in runs)
     kind_tag = (
-        f"_kind{opts.two_opt_kind}" + (f"_k{opts.two_opt_knn_k}" if opts.two_opt_kind == 'knn' else "")
-        if has_knn else ""
+        f"_kind{opts.two_opt_kind}"
+        + (f"_k{opts.two_opt_knn_k}" if opts.two_opt_kind == "knn" else "")
+        + (
+            f"_r{opts.two_opt_radius}"
+            if (
+                opts.two_opt_kind == "radius"
+                and getattr(opts, "two_opt_radius", None) is not None
+            )
+            else ""
+        )
+        + (
+            f"_rmin{opts.two_opt_radius_min}_rmax{opts.two_opt_radius_max}"
+            if (
+                opts.two_opt_kind == "range_radius"
+                and getattr(opts, "two_opt_radius_min", None) is not None
+                and getattr(opts, "two_opt_radius_max", None) is not None
+            )
+            else ""
+        )
+        if (has_knn or has_radius or has_range)
+        else ""
     )
-    tag = (f"tsp{opts.problem_size}_w{opts.width}"
-           f"_lens{'-'.join(map(str, opts.revision_lens))}"
-           f"_iters{'-'.join(map(str, opts.revision_iters))}_2opt{opts.two_opt_iters}"
-           f"{kind_tag}")
-    out_path = os.path.join(opts.out_dir, f'twoopt_compare_{tag}.png')
+    tag = (
+        f"tsp{opts.problem_size}_w{opts.width}"
+        f"_lens{'-'.join(map(str, opts.revision_lens))}"
+        f"_iters{'-'.join(map(str, opts.revision_iters))}_2opt{opts.two_opt_iters}"
+        f"{kind_tag}"
+    )
+    out_path = os.path.join(opts.out_dir, f"twoopt_compare_{tag}.png")
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
+
+
+def _build_tag(opts):
+    """Reconstruct the deterministic filename tag shared by every PNG in this run.
+
+    Mirrors the tag built inside ``plot_comparison`` so the swap-distance
+    histogram lines up with the comparison figure on disk.
+    """
+    runs_for_tag = getattr(opts, "_runs_for_tag", [])
+    has_knn = any(r["label"].startswith("knn") for r in runs_for_tag)
+    has_radius = any(r["label"].startswith("radius") for r in runs_for_tag)
+    has_range = any(r["label"].startswith("range") for r in runs_for_tag)
+    kind_tag = (
+        f"_kind{opts.two_opt_kind}"
+        + (f"_k{opts.two_opt_knn_k}" if opts.two_opt_kind == "knn" else "")
+        + (
+            f"_r{opts.two_opt_radius}"
+            if (
+                opts.two_opt_kind == "radius"
+                and getattr(opts, "two_opt_radius", None) is not None
+            )
+            else ""
+        )
+        + (
+            f"_rmin{opts.two_opt_radius_min}_rmax{opts.two_opt_radius_max}"
+            if (
+                opts.two_opt_kind == "range_radius"
+                and getattr(opts, "two_opt_radius_min", None) is not None
+                and getattr(opts, "two_opt_radius_max", None) is not None
+            )
+            else ""
+        )
+        if (has_knn or has_radius or has_range)
+        else ""
+    )
+    return (
+        f"tsp{opts.problem_size}_w{opts.width}"
+        f"_lens{'-'.join(map(str, opts.revision_lens))}"
+        f"_iters{'-'.join(map(str, opts.revision_iters))}_2opt{opts.two_opt_iters}"
+        f"{kind_tag}"
+    )
+
+
+def plot_swap_distance_histograms(runs, opts):
+    """Plot the swap-distance distribution per mode as a sibling PNG.
+
+    Distance is the cyclic short-arc hop along the closed tour:
+    ``min(|i-j|, N - |i-j|)``. Bounded by ``N // 2`` since the smaller
+    of the two arcs is at most half the tour.
+
+    Two panels:
+      * absolute short-arc distance (0..N/2) with a dashed line at
+        ``two_opt_knn_k`` to surface the KNN candidate cap;
+      * same data normalised to tour length (0..0.5) so cross-problem-size
+        comparisons are meaningful.
+
+    Skipped (returns ``None``) when no run recorded any swaps, i.e.
+    ``--record_two_opt_swaps`` was not set or every 2-opt mode was OOM-skipped.
+    """
+    # Only consider runs that actually have data.
+    plotted = [r for r in runs if r.get("swap_dists")]
+    if not plotted:
+        return None
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    colors = {
+        "baseline": "#7f7f7f",
+        "final": "#1f77b4",
+        "per_iter": "#d62728",
+        "knn_final": "#2ca02c",
+        "knn_per_iter": "#9467bd",
+        "radius_final": "#ff7f0e",
+        "radius_per_iter": "#8c564b",
+        "range_final": "#e377c2",
+        "range_per_iter": "#bcbd22",
+        "range_wide_final": "#17becf",
+        "range_wide_per_iter": "#9edae5",
+    }
+
+    fig, (ax_abs, ax_norm) = plt.subplots(1, 2, figsize=(13, 5))
+
+    N = opts.problem_size
+    abs_max = max(1, N // 2)
+    norm_max = 0.5
+    n_bins_abs = min(abs_max, 50)
+    n_bins_norm = 30
+
+    for r in plotted:
+        d = r["swap_dists"]
+        color = colors.get(r["label"], None)
+        ax_abs.hist(
+            d,
+            bins=n_bins_abs,
+            range=(0, abs_max),
+            density=True,
+            alpha=0.5,
+            color=color,
+            label=f"{r['label']} (n={len(d)})",
+        )
+        ax_norm.hist(
+            [x / N for x in d],
+            bins=n_bins_norm,
+            range=(0.0, norm_max),
+            density=True,
+            alpha=0.5,
+            color=color,
+            label=f"{r['label']} (n={len(d)})",
+        )
+
+    # Vertical dashed line on both panels marking the KNN candidate cap.
+    # (Also drawn when the radius kind is active so radius-only comparisons
+    # still show a candidate-cap reference line at --two_opt_knn_k.)
+    ax_abs.axvline(
+        opts.two_opt_knn_k,
+        color="gray",
+        linestyle="--",
+        alpha=0.6,
+        label=f"knn k={opts.two_opt_knn_k}",
+    )
+    ax_norm.axvline(
+        opts.two_opt_knn_k / N,
+        color="gray",
+        linestyle="--",
+        alpha=0.6,
+        label=f"knn k={opts.two_opt_knn_k}",
+    )
+
+    ax_abs.set_xlabel("min(|i-j|, N-|i-j|)  (short-arc hop distance)")
+    ax_abs.set_ylabel("density")
+    ax_abs.set_title("Accepted swap distances (short-arc)")
+    ax_abs.grid(True, alpha=0.3)
+    ax_abs.legend(loc="best", fontsize=9)
+
+    ax_norm.set_xlabel("min(|i-j|, N-|i-j|) / N  (normalised to tour length)")
+    ax_norm.set_ylabel("density")
+    ax_norm.set_title("Accepted swap distances (normalised)")
+    ax_norm.grid(True, alpha=0.3)
+    ax_norm.legend(loc="best", fontsize=9)
+
+    fig.suptitle(
+        f"GLOP 2-opt swap-distance histogram — tsp{opts.problem_size}, "
+        f"width={opts.width}, lens={opts.revision_lens}, "
+        f"iters={opts.revision_iters}, 2opt_iters={opts.two_opt_iters}, "
+        f"kind={opts.two_opt_kind}, knn_k={opts.two_opt_knn_k}",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.88)
+
+    os.makedirs(opts.out_dir, exist_ok=True)
+    # Stash runs on opts so _build_tag can compute has_knn without threading
+    # another parameter through this stack.
+    opts._runs_for_tag = runs
+    tag = _build_tag(opts)
+    out_path = os.path.join(opts.out_dir, f"twoopt_swap_dists_{tag}.png")
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
     return out_path
@@ -338,58 +787,81 @@ def print_table(runs):
     # Pick a non-OOM baseline; fall back to the first run if even baseline OOMed.
     base_avg = None
     for r in runs:
-        if r['label'] == 'baseline' and not r.get('skipped'):
-            base_avg = r['avg']
+        if r["label"] == "baseline" and not r.get("skipped"):
+            base_avg = r["avg"]
             break
     if base_avg is None or (isinstance(base_avg, float) and math.isnan(base_avg)):
         for r in runs:
-            if not r.get('skipped') and not math.isnan(r['avg']):
-                base_avg = r['avg']
+            if not r.get("skipped") and not math.isnan(r["avg"]):
+                base_avg = r["avg"]
                 break
-    print('\n================= Final performance =================')
-    header = (f"{'mode':<14}{'kind':<6}{'avg cost':>12}{'best cost':>12}"
-              f"{'impr% vs base':>16}{'time (s)':>12}")
+    print("\n================= Final performance =================")
+    header = (
+        f"{'mode':<14}{'kind':<6}{'avg cost':>12}{'best cost':>12}"
+        f"{'impr% vs base':>16}{'time (s)':>12}"
+    )
     print(header)
-    print('-' * len(header))
+    print("-" * len(header))
     # Infer kind from the mode label if not already on the record.
     for r in runs:
-        if 'two_opt_kind' not in r:
-            r['two_opt_kind'] = 'knn' if r['label'].startswith('knn') else 'full'
+        if "two_opt_kind" not in r:
+            if r["label"].startswith("knn"):
+                r["two_opt_kind"] = "knn"
+            elif r["label"].startswith("range"):
+                r["two_opt_kind"] = "range_radius"
+            elif r["label"].startswith("radius"):
+                r["two_opt_kind"] = "radius"
+            else:
+                r["two_opt_kind"] = "full"
     for r in runs:
-        if r.get('skipped') or math.isnan(r['avg']):
+        if r.get("skipped") or math.isnan(r["avg"]):
             # OOM rows: render placeholders so the table stays aligned.
-            print(f"{r['label']:<14}{r['two_opt_kind']:<6}{'OOM':>12}"
-                  f"{'OOM':>12}{'-':>16}{'-':>12}")
+            print(
+                f"{r['label']:<14}{r['two_opt_kind']:<6}{'OOM':>12}"
+                f"{'OOM':>12}{'-':>16}{'-':>12}"
+            )
             continue
-        impr = (100.0 * (base_avg - r['avg']) / base_avg
-                if base_avg and not math.isnan(base_avg) else 0.0)
-        print(f"{r['label']:<14}{r['two_opt_kind']:<6}{r['avg']:>12.4f}"
-              f"{r['best']:>12.4f}{impr:>15.2f}%{r['duration']:>12.2f}")
-    print('=====================================================')
+        impr = (
+            100.0 * (base_avg - r["avg"]) / base_avg
+            if base_avg and not math.isnan(base_avg)
+            else 0.0
+        )
+        print(
+            f"{r['label']:<14}{r['two_opt_kind']:<6}{r['avg']:>12.4f}"
+            f"{r['best']:>12.4f}{impr:>15.2f}%{r['duration']:>12.2f}"
+        )
+    print("=====================================================")
 
 
 def main():
     opts = build_base_opts()
-    print('using device:', opts.device)
-    print('dataset:', opts.path)
-    assert os.path.exists(opts.path), f'dataset not found: {opts.path}'
+    print("using device:", opts.device)
+    print("dataset:", opts.path)
+    assert os.path.exists(opts.path), f"dataset not found: {opts.path}"
 
     revisers = load_revisers(opts)
 
     t0 = time.time()
     # Use the OOM-safe wrapper so a single mode running out of memory does
     # not abort the whole comparison. Other exception types still propagate.
-    runs = [_safe_run_mode(label, use2, mode, kind, knn_k, opts, revisers)
-            for (label, use2, mode, kind, knn_k) in MODES]
-    skipped = [r['label'] for r in runs if r.get('skipped')]
+    modes = make_modes(opts)
+    runs = [
+        _safe_run_mode(
+            label, use2, mode, kind, knn_k, radius, r_min, r_max, opts, revisers
+        )
+        for (label, use2, mode, kind, knn_k, radius, r_min, r_max) in modes
+    ]
+    skipped = [r["label"] for r in runs if r.get("skipped")]
     if skipped:
-        print(f'\n[NOTE] Skipped modes due to OOM: {", ".join(skipped)}',
-              flush=True)
+        print(f'\n[NOTE] Skipped modes due to OOM: {", ".join(skipped)}', flush=True)
     print_table(runs)
     out_path = plot_comparison(runs, opts)
-    print(f'\n=== Comparison figure saved to: {out_path} ===')
-    print(f'=== Total wall-clock: {time.time() - t0:.2f}s ===')
+    print(f"\n=== Comparison figure saved to: {out_path} ===")
+    swap_path = plot_swap_distance_histograms(runs, opts)
+    if swap_path is not None:
+        print(f"=== Swap-distance histogram saved to: {swap_path} ===")
+    print(f"=== Total wall-clock: {time.time() - t0:.2f}s ===")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

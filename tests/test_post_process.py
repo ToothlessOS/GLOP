@@ -19,6 +19,10 @@ from utils.post_process import (
     _knn_edges_scipy,
     _pyg_knn_graph,
     knn_2opt_gain_matrix,
+    radius_2opt,
+    radius_2opt_gain_matrix,
+    range_radius_2opt,
+    range_radius_2opt_gain_matrix,
 )
 
 # eval_2opt imports happen lazily inside its tests below, since eval_2opt
@@ -190,6 +194,471 @@ def test_knn_no_invalid_self_move():
     c0 = tour_cost(coords).item()
     c1 = tour_cost(out).item()
     assert c1 <= c0 + 1e-5, (c0, c1)
+
+
+# ---------------------------------------------------------------------------
+# Radius-sparse 2-opt tests
+# ---------------------------------------------------------------------------
+
+
+def test_radius_gain_matrix_shape_and_contract():
+    # The return contract must match knn_2opt_gain_matrix so the same driver
+    # code can aggregate per-instance gains via scatter_max.
+    torch.manual_seed(70)
+    B, N, r = 3, 20, 5
+    seeds = torch.rand(B, N, 2)
+    tour, edge_gain, idx_tuple = radius_2opt_gain_matrix(seeds, radius=r)
+    # tour shape unchanged
+    assert tour.shape == (B, N)
+    # edge count = B * N * 2*(r-1) offsets (each batch slice has the same count)
+    assert edge_gain.shape == (B * N * 2 * (r - 1),)
+    # idx_tuple = (src_b, src_i, dst_j), all flat int tensors
+    assert idx_tuple is not None and len(idx_tuple) == 3
+    src_b, src_i, dst_j = idx_tuple
+    assert src_b.shape == src_i.shape == dst_j.shape == edge_gain.shape
+    # All batch indices in [0, B); all positions in [0, N).
+    assert src_b.min().item() >= 0 and src_b.max().item() < B
+    assert src_i.min().item() >= 0 and src_i.max().item() < N
+    assert dst_j.min().item() >= 0 and dst_j.max().item() < N
+
+
+def test_radius_gain_matrix_handles_radius_two():
+    # radius=2 means only offset ±2 -> 2*(R-1)=2 offsets per base position.
+    # Should still return a valid gain vector and not crash.
+    torch.manual_seed(71)
+    B, N = 2, 12
+    seeds = torch.rand(B, N, 2)
+    tour, edge_gain, idx_tuple = radius_2opt_gain_matrix(seeds, radius=2)
+    assert tour.shape == (B, N)
+    assert edge_gain.shape == (B * N * 2 * (2 - 1),)  # = B * N * 2
+    assert idx_tuple is not None
+
+
+def test_radius_gain_matrix_default_radius_large_n():
+    # Sanity: with a fairly large N the gain computation must terminate in a
+    # reasonable time and produce the expected edge count (no memory blow-up).
+    import time
+    torch.manual_seed(72)
+    B, N, r = 2, 500, 25
+    seeds = torch.rand(B, N, 2)
+    t0 = time.time()
+    _, edge_gain, idx_tuple = radius_2opt_gain_matrix(seeds, radius=r)
+    dt = time.time() - t0
+    assert idx_tuple is not None
+    assert edge_gain.shape == (B * N * 2 * (r - 1),)
+    assert dt < 30.0, f"radius_2opt_gain_matrix took {dt:.2f}s on N=500"
+
+
+def test_radius_shape_roundtrip():
+    torch.manual_seed(73)
+    x = torch.rand(4, 15, 2)
+    for r in (3, 5, 10):
+        out = radius_2opt(x, iters=10, r=r)
+        assert out.shape == x.shape
+
+
+def test_radius_does_not_mutate_input():
+    torch.manual_seed(74)
+    x = torch.rand(3, 15, 2)
+    x_before = x.clone()
+    _ = radius_2opt(x, iters=10, r=10)
+    assert torch.equal(x, x_before)
+
+
+def test_radius_never_worsens_random():
+    # Central invariant: only positive-gain moves are applied, so tour cost
+    # is non-increasing.
+    torch.manual_seed(75)
+    x = torch.rand(8, 30, 2)
+    c0 = tour_cost(x)
+    out = radius_2opt(x, iters=25, r=5)
+    c1 = tour_cost(out)
+    assert (c1 <= c0 + 1e-5).all(), (c0, c1)
+
+
+def test_radius_known_crossed_square():
+    # Tour positions in the crossed square are 4; radius=2 already covers
+    # the (i=0, j=2) and (i=1, j=3) flip pairs, so the optimum is reachable.
+    coords = torch.tensor([[[0., 0.], [1., 1.], [1., 0.], [0., 1.]]])
+    out = radius_2opt(coords, iters=10, r=2)
+    c1 = tour_cost(out).item()
+    assert abs(c1 - 4.0) < 1e-5, c1
+
+
+def test_radius_no_invalid_self_move():
+    # Wrap-around regression: tour of 4 collinear points, radius=2. The
+    # offset (i=0, j=N-1=3) corresponds to (i+1)%N == j -- i.e. a wrap-around
+    # adjacent edge -- and must be masked out so the algorithm cannot pick it.
+    coords = torch.tensor([[[0., 0.], [1., 0.], [2., 0.], [3., 0.]]])
+    out = radius_2opt(coords, iters=10, r=2)
+    c0 = tour_cost(coords).item()
+    c1 = tour_cost(out).item()
+    assert c1 <= c0 + 1e-5, (c0, c1)
+
+
+def test_radius_multi_sweep_no_crash():
+    torch.manual_seed(76)
+    x = torch.rand(2, 30, 2)
+    out = radius_2opt(x, iters=50, r=10)
+    assert out.shape == x.shape
+
+
+def test_radius_radius_monotonicity():
+    # Larger radius should never give worse mean cost than smaller radius
+    # over a random batch: more candidates ⊇ more improving moves.
+    torch.manual_seed(77)
+    x = torch.rand(8, 25, 2)
+    c0 = tour_cost(x)
+    out_small = radius_2opt(x, iters=15, r=3)
+    out_large = radius_2opt(x, iters=15, r=10)
+    mean_small = (tour_cost(out_small) - c0).mean().item()
+    mean_large = (tour_cost(out_large) - c0).mean().item()
+    assert mean_large <= mean_small + 1e-5, (mean_small, mean_large)
+
+
+def test_radius_with_r_too_small():
+    # Degenerate: r=2 means only one offset pair; algorithm must still
+    # terminate and return a tour of the right shape; cost may not improve.
+    torch.manual_seed(78)
+    x = torch.rand(2, 12, 2)
+    out = radius_2opt(x, iters=5, r=2)
+    assert out.shape == x.shape
+    c0 = tour_cost(x)
+    c1 = tour_cost(out)
+    assert (c1 <= c0 + 1e-5).all()
+
+
+def test_radius_debug_does_not_crash_or_miscompute():
+    # debug=True must produce the same tour as debug=False (no side effects
+    # on output) and remain cost-non-worsening.
+    import contextlib, io
+
+    torch.manual_seed(79)
+    x = torch.rand(4, 30, 2)
+    c0 = tour_cost(x)
+    with contextlib.redirect_stdout(io.StringIO()) as quiet:
+        out_dbg = radius_2opt(x, iters=5, r=10, debug=True)
+        out_silent = radius_2opt(x.clone(), iters=5, r=10, debug=False)
+
+    torch.testing.assert_close(out_dbg, out_silent)
+    assert (tour_cost(out_dbg) <= c0 + 1e-5).all()
+
+
+def test_maybe_two_opt_dispatch_radius():
+    # 'radius' routes to radius_2opt and honours two_opt_radius.
+    torch.manual_seed(80)
+    x = torch.rand(4, 30, 2)
+    opts = _make_opts(
+        use_2opt=True,
+        two_opt_iters=10,
+        two_opt_kind='radius',
+        two_opt_radius=5,
+    )
+    out = maybe_two_opt(x, opts)
+    assert out.shape == x.shape
+    assert (tour_cost(out) <= tour_cost(x) + 1e-5).all()
+
+
+def test_maybe_two_opt_dispatch_radius_default_fallback():
+    # two_opt_radius=None falls back to ~10% of N in the dispatcher.
+    torch.manual_seed(81)
+    N = 50
+    x = torch.rand(2, N, 2)
+    opts = _make_opts(
+        use_2opt=True,
+        two_opt_iters=10,
+        two_opt_kind='radius',
+        # two_opt_radius intentionally absent -> dispatcher default.
+    )
+    assert not hasattr(opts, 'two_opt_radius')
+    out = maybe_two_opt(x, opts)
+    assert out.shape == x.shape
+    assert (tour_cost(out) <= tour_cost(x) + 1e-5).all()
+
+
+# ---------------------------------------------------------------------------
+# Range-radius-sparse 2-opt tests
+# ---------------------------------------------------------------------------
+
+
+def test_range_gain_matrix_shape_and_contract():
+    # The return contract must match radius_2opt_gain_matrix so the same
+    # driver code can aggregate per-instance gains via scatter_max.
+    torch.manual_seed(90)
+    B, N, r_min, r_max = 3, 20, 2, 5
+    seeds = torch.rand(B, N, 2)
+    tour, edge_gain, idx_tuple = range_radius_2opt_gain_matrix(
+        seeds, r_min=r_min, r_max=r_max
+    )
+    # tour shape unchanged
+    assert tour.shape == (B, N)
+    # edge count = B * N * 2*(r_max - r_min + 1) offsets per batch slice.
+    assert edge_gain.shape == (B * N * 2 * (r_max - r_min + 1),)
+    # idx_tuple = (src_b, src_i, dst_j), all flat int tensors
+    assert idx_tuple is not None and len(idx_tuple) == 3
+    src_b, src_i, dst_j = idx_tuple
+    assert src_b.shape == src_i.shape == dst_j.shape == edge_gain.shape
+    # All batch indices in [0, B); all positions in [0, N).
+    assert src_b.min().item() >= 0 and src_b.max().item() < B
+    assert src_i.min().item() >= 0 and src_i.max().item() < N
+    assert dst_j.min().item() >= 0 and dst_j.max().item() < N
+
+
+def test_range_gain_matrix_small_window():
+    # r_min=2, r_max=3 -> offsets {2, 3, -2, -3} -> 4 offsets per base position.
+    torch.manual_seed(91)
+    B, N = 2, 12
+    seeds = torch.rand(B, N, 2)
+    tour, edge_gain, idx_tuple = range_radius_2opt_gain_matrix(
+        seeds, r_min=2, r_max=3
+    )
+    assert tour.shape == (B, N)
+    assert edge_gain.shape == (B * N * 2 * (3 - 2 + 1),)  # = B * N * 4
+    assert idx_tuple is not None
+
+
+def test_range_gain_matrix_handles_r_max_eq_r_min():
+    # Degenerate: r_max == r_min collapses to a single offset pair, equivalent
+    # to the radius=2 case in radius_2opt_gain_matrix.
+    torch.manual_seed(92)
+    B, N = 2, 12
+    seeds = torch.rand(B, N, 2)
+    tour, edge_gain, idx_tuple = range_radius_2opt_gain_matrix(
+        seeds, r_min=2, r_max=2
+    )
+    assert tour.shape == (B, N)
+    assert edge_gain.shape == (B * N * 2 * 1,)  # = B * N * 2
+    assert idx_tuple is not None
+
+
+def test_range_gain_matrix_r_min_too_small_raises():
+    # r_min=1 includes offset ±1 which are invalid 2-opt moves; the gain
+    # matrix must reject them up-front rather than silently masking them out.
+    torch.manual_seed(93)
+    seeds = torch.rand(2, 12, 2)
+    try:
+        range_radius_2opt_gain_matrix(seeds, r_min=1, r_max=5)
+    except ValueError:
+        return
+    raise AssertionError("range_radius_2opt_gain_matrix should raise on r_min<2")
+
+
+def test_range_gain_matrix_r_max_lt_r_min_raises():
+    # Inverted range must be rejected when both args are explicit library
+    # inputs (dispatcher applies a friendlier warn+swap policy).
+    torch.manual_seed(94)
+    seeds = torch.rand(2, 12, 2)
+    try:
+        range_radius_2opt_gain_matrix(seeds, r_min=5, r_max=2)
+    except ValueError:
+        return
+    raise AssertionError("range_radius_2opt_gain_matrix should raise on r_max<r_min")
+
+
+def test_range_gain_matrix_r_min_too_large_does_not_raise():
+    # r_min > N: offsets wrap via `% N` so destinations stay in [0, N); the
+    # gain matrix still produces a valid result (some edges get masked).
+    torch.manual_seed(95)
+    seeds = torch.rand(1, 8, 2)
+    tour, edge_gain, idx_tuple = range_radius_2opt_gain_matrix(
+        seeds, r_min=20, r_max=25
+    )
+    assert tour.shape == (1, 8)
+    assert edge_gain.numel() > 0
+    assert idx_tuple is not None
+
+
+def test_range_gain_matrix_large_n():
+    # Sanity: large N must terminate in a reasonable time.
+    import time
+    torch.manual_seed(96)
+    B, N = 2, 500
+    seeds = torch.rand(B, N, 2)
+    t0 = time.time()
+    _, edge_gain, idx_tuple = range_radius_2opt_gain_matrix(
+        seeds, r_min=5, r_max=25
+    )
+    dt = time.time() - t0
+    assert idx_tuple is not None
+    assert edge_gain.shape == (B * N * 2 * (25 - 5 + 1),)
+    assert dt < 30.0, f"range_radius_2opt_gain_matrix took {dt:.2f}s on N=500"
+
+
+def test_range_shape_roundtrip():
+    torch.manual_seed(97)
+    x = torch.rand(4, 15, 2)
+    for r_min, r_max in ((2, 3), (2, 5), (2, 10)):
+        out = range_radius_2opt(x, iters=10, r_min=r_min, r_max=r_max)
+        assert out.shape == x.shape
+
+
+def test_range_does_not_mutate_input():
+    torch.manual_seed(98)
+    x = torch.rand(3, 15, 2)
+    x_before = x.clone()
+    _ = range_radius_2opt(x, iters=10, r_min=2, r_max=10)
+    assert torch.equal(x, x_before)
+
+
+def test_range_never_worsens_random():
+    # Central invariant: only positive-gain moves are applied, so tour cost
+    # is non-increasing.
+    torch.manual_seed(99)
+    x = torch.rand(8, 30, 2)
+    c0 = tour_cost(x)
+    out = range_radius_2opt(x, iters=25, r_min=2, r_max=5)
+    c1 = tour_cost(out)
+    assert (c1 <= c0 + 1e-5).all(), (c0, c1)
+
+
+def test_range_known_crossed_square():
+    # Tour positions in the crossed square are 4; r_min=2, r_max=2 covers the
+    # (i=0, j=2) and (i=1, j=3) flip pairs, so the optimum is reachable.
+    coords = torch.tensor([[[0., 0.], [1., 1.], [1., 0.], [0., 1.]]])
+    out = range_radius_2opt(coords, iters=10, r_min=2, r_max=2)
+    c1 = tour_cost(out).item()
+    assert abs(c1 - 4.0) < 1e-5, c1
+
+
+def test_range_no_invalid_self_move():
+    # Wrap-around regression: tour of 4 collinear points, (r_min, r_max)=(2,2).
+    # The offset (i=0, j=N-1=3) must be masked out so the algorithm cannot
+    # pick it.
+    coords = torch.tensor([[[0., 0.], [1., 0.], [2., 0.], [3., 0.]]])
+    out = range_radius_2opt(coords, iters=10, r_min=2, r_max=2)
+    c0 = tour_cost(coords).item()
+    c1 = tour_cost(out).item()
+    assert c1 <= c0 + 1e-5, (c0, c1)
+
+
+def test_range_multi_sweep_no_crash():
+    torch.manual_seed(100)
+    x = torch.rand(2, 30, 2)
+    out = range_radius_2opt(x, iters=50, r_min=2, r_max=10)
+    assert out.shape == x.shape
+
+
+def test_range_monotonicity():
+    # Larger r_max should never give worse mean cost than smaller r_max over
+    # a random batch: more candidates ⊇ more improving moves.
+    torch.manual_seed(101)
+    x = torch.rand(8, 25, 2)
+    c0 = tour_cost(x)
+    out_small = range_radius_2opt(x, iters=15, r_min=2, r_max=3)
+    out_large = range_radius_2opt(x, iters=15, r_min=2, r_max=10)
+    mean_small = (tour_cost(out_small) - c0).mean().item()
+    mean_large = (tour_cost(out_large) - c0).mean().item()
+    assert mean_large <= mean_small + 1e-5, (mean_small, mean_large)
+
+
+def test_range_matches_radius_at_single_window():
+    # Parity: range_radius_2opt with (r_min=2, r_max=R) is semantically
+    # equivalent to radius_2opt with radius=R — both produce the same offset
+    # set {2, 3, ..., R} in both signs. This is the strongest check that the
+    # refactor preserved semantics.
+    torch.manual_seed(102)
+    x = torch.rand(4, 20, 2)
+    for r in (2, 5, 10):
+        out_radius = radius_2opt(x.clone(), iters=10, r=r)
+        out_range = range_radius_2opt(x.clone(), iters=10, r_min=2, r_max=r)
+        torch.testing.assert_close(out_range, out_radius)
+
+
+def test_range_debug_does_not_crash_or_miscompute():
+    # debug=True must produce the same tour as debug=False (no side effects
+    # on output) and remain cost-non-worsening.
+    import contextlib, io
+
+    torch.manual_seed(103)
+    x = torch.rand(4, 30, 2)
+    c0 = tour_cost(x)
+    with contextlib.redirect_stdout(io.StringIO()) as quiet:
+        out_dbg = range_radius_2opt(x, iters=5, r_min=2, r_max=10, debug=True)
+        out_silent = range_radius_2opt(
+            x.clone(), iters=5, r_min=2, r_max=10, debug=False
+        )
+
+    torch.testing.assert_close(out_dbg, out_silent)
+    assert (tour_cost(out_dbg) <= c0 + 1e-5).all()
+
+
+def test_range_driver_default_both_none():
+    # Library-direct call with both args None defaults to (2, max(2, N//10)).
+    torch.manual_seed(104)
+    x = torch.rand(2, 30, 2)
+    out = range_radius_2opt(x, iters=10)
+    assert out.shape == x.shape
+    assert (tour_cost(out) <= tour_cost(x) + 1e-5).all()
+
+
+def test_range_driver_swap_warns():
+    # Inverted args from a library caller emit a UserWarning and still run.
+    import warnings as _w
+
+    torch.manual_seed(105)
+    x = torch.rand(2, 20, 2)
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        out = range_radius_2opt(x, iters=5, r_min=20, r_max=5)
+    assert any("swapping" in str(w.message) for w in caught), [str(w.message) for w in caught]
+    assert out.shape == x.shape
+
+
+def test_maybe_two_opt_dispatch_range_radius():
+    # 'range_radius' routes to range_radius_2opt and honours the two bounds.
+    torch.manual_seed(106)
+    x = torch.rand(4, 30, 2)
+    opts = _make_opts(
+        use_2opt=True,
+        two_opt_iters=10,
+        two_opt_kind='range_radius',
+        two_opt_radius_min=2,
+        two_opt_radius_max=5,
+    )
+    out = maybe_two_opt(x, opts)
+    assert out.shape == x.shape
+    assert (tour_cost(out) <= tour_cost(x) + 1e-5).all()
+
+
+def test_maybe_two_opt_dispatch_range_radius_default_fallback():
+    # Both two_opt_radius_min and two_opt_radius_max absent -> dispatcher
+    # falls back to (2, max(2, N // 10)).
+    torch.manual_seed(107)
+    N = 50
+    x = torch.rand(2, N, 2)
+    opts = _make_opts(
+        use_2opt=True,
+        two_opt_iters=10,
+        two_opt_kind='range_radius',
+        # two_opt_radius_min and two_opt_radius_max intentionally absent.
+    )
+    assert not hasattr(opts, 'two_opt_radius_min')
+    assert not hasattr(opts, 'two_opt_radius_max')
+    out = maybe_two_opt(x, opts)
+    assert out.shape == x.shape
+    assert (tour_cost(out) <= tour_cost(x) + 1e-5).all()
+
+
+def test_maybe_two_opt_dispatch_range_radius_swapped_silently():
+    # Inverted bounds at the dispatcher level emit a UserWarning and still
+    # run (dispatcher is friendlier than the gain-matrix layer).
+    import warnings as _w
+
+    torch.manual_seed(108)
+    x = torch.rand(2, 20, 2)
+    opts = _make_opts(
+        use_2opt=True,
+        two_opt_iters=5,
+        two_opt_kind='range_radius',
+        two_opt_radius_min=20,
+        two_opt_radius_max=5,
+    )
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        out = maybe_two_opt(x, opts)
+    assert any("swapping" in str(w.message) for w in caught), \
+        [str(w.message) for w in caught]
+    assert out.shape == x.shape
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +1065,7 @@ def test_safe_run_mode_catches_oom_and_returns_sentinel():
             pass
 
         sentinel = e2._safe_run_mode(
-            'knn_per_iter', True, 'per_iter', 'knn', 20,
+            'knn_per_iter', True, 'per_iter', 'knn', 20, None, None, None,
             _O(), revisers=[],
         )
     finally:
@@ -627,8 +1096,8 @@ def test_safe_run_mode_propagates_non_oom():
 
         propagated = False
         try:
-            e2._safe_run_mode('final', True, 'final', 'full', 20,
-                              _O(), revisers=[])
+            e2._safe_run_mode('final', True, 'final', 'full', 20, None,
+                              None, None, _O(), revisers=[])
         except ValueError:
             propagated = True
     finally:
@@ -651,8 +1120,8 @@ def test_safe_run_mode_propagates_keyboard_interrupt():
 
         propagated = False
         try:
-            e2._safe_run_mode('per_iter', True, 'per_iter', 'full', 20,
-                              _O(), revisers=[])
+            e2._safe_run_mode('per_iter', True, 'per_iter', 'full', 20, None,
+                              None, None, _O(), revisers=[])
         except KeyboardInterrupt:
             propagated = True
     finally:

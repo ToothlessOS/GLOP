@@ -309,11 +309,26 @@ if __name__ == "__main__":
     parser.add_argument('--two_opt_iters', type=int, default=10,
                         help='Max number of 2-opt sweeps per invocation')
     parser.add_argument('--two_opt_kind', type=str, default='full',
-                        choices=['full', 'knn'],
-                        help="2-opt algorithm variant: 'full' (dense candidate set) "
-                             "or 'knn' (k-NN-sparse; uses --two_opt_knn_k)")
+                        choices=['full', 'knn', 'radius', 'range_radius'],
+                        help="2-opt algorithm variant: 'full' (dense candidate set), "
+                             "'knn' (k-NN-sparse; uses --two_opt_knn_k), "
+                             "'radius' (tour-position-sparse; uses --two_opt_radius), "
+                             "or 'range_radius' (tour-position-sparse over "
+                             "[r_min, r_max]; uses --two_opt_radius_min / "
+                             "--two_opt_radius_max)")
     parser.add_argument('--two_opt_knn_k', type=int, default=20,
                         help='k for KNN-sparse 2-opt (only used when --two_opt_kind=knn)')
+    parser.add_argument('--two_opt_radius', type=int, default=None,
+                        help='r for radius-sparse 2-opt (only used when '
+                             '--two_opt_kind=radius). Default: 10%% of '
+                             '--problem_size (floored at 2).')
+    parser.add_argument('--two_opt_radius_min', type=int, default=2,
+                        help='r_min for range-radius 2-opt (only used when '
+                             '--two_opt_kind=range_radius). Default: 2.')
+    parser.add_argument('--two_opt_radius_max', type=int, default=None,
+                        help='r_max for range-radius 2-opt (only used when '
+                             '--two_opt_kind=range_radius). Default: 10%% of '
+                             '--problem_size (floored at max(r_min, 2)).')
     parser.add_argument('--two_opt_debug', action='store_true',
                         help='Print per-sweep 2-opt phase timings to stdout '
                              '(knn_graph construction, candidate extraction, '
