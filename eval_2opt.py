@@ -67,6 +67,39 @@ def _is_oom_error(exc):
     return False
 
 
+# Deterministic per-label fallback colors for plot dicts. Hashing the label
+# string gives every unknown label a stable, distinct color across panels
+# (line plot, bar chart, swap-distance histogram) without requiring an entry
+# in the hand-picked ``colors`` dict — useful when users add custom mode
+# rows like ``decomp_per_iter_5`` with radius baked into the name.
+_RANDOM_MARKERS = ("o", "s", "D", "v", "^", "P", "X", "p", "h", "*", "d", "<", ">")
+
+
+def _random_color(label):
+    """Stable hex color for an unknown plot label.
+
+    Hashes the label so the same label always gets the same color across
+    all panels of the comparison figure, while different labels produce
+    visually distinct hues.
+    """
+    import hashlib
+
+    return "#" + hashlib.md5(label.encode("utf-8")).hexdigest()[:6]
+
+
+def _random_marker(label):
+    """Stable matplotlib marker for an unknown plot label.
+
+    Pairs with ``_random_color`` to keep unknown-label series visually
+    distinguishable in the line plot.
+    """
+    import hashlib
+
+    return _RANDOM_MARKERS[
+        int(hashlib.md5(label.encode("utf-8")).hexdigest(), 16) % len(_RANDOM_MARKERS)
+    ]
+
+
 def _safe_run_mode(
     label,
     use_2opt,
@@ -76,6 +109,9 @@ def _safe_run_mode(
     two_opt_radius,
     two_opt_radius_min,
     two_opt_radius_max,
+    two_opt_decomp_radius,
+    two_opt_sampling_base,
+    two_opt_sampling_r,
     base_opts,
     revisers,
 ):
@@ -98,6 +134,9 @@ def _safe_run_mode(
             two_opt_radius,
             two_opt_radius_min,
             two_opt_radius_max,
+            two_opt_decomp_radius,
+            two_opt_sampling_base,
+            two_opt_sampling_r,
             base_opts,
             revisers,
         )
@@ -114,7 +153,9 @@ def _safe_run_mode(
             f"\n[ERROR] OOM in mode={label} "
             f"(kind={two_opt_kind}, knn_k={two_opt_knn_k}, "
             f"radius={two_opt_radius}, "
-            f"r_min={two_opt_radius_min}, r_max={two_opt_radius_max}); "
+            f"r_min={two_opt_radius_min}, r_max={two_opt_radius_max}, "
+            f"decomp_r={two_opt_decomp_radius}, "
+            f"samp_base={two_opt_sampling_base}, samp_r={two_opt_sampling_r}); "
             f"skipping this mode. error={exc!r}\n",
             flush=True,
         )
@@ -125,6 +166,9 @@ def _safe_run_mode(
             "two_opt_radius": two_opt_radius,
             "two_opt_radius_min": two_opt_radius_min,
             "two_opt_radius_max": two_opt_radius_max,
+            "two_opt_decomp_radius": two_opt_decomp_radius,
+            "two_opt_sampling_base": two_opt_sampling_base,
+            "two_opt_sampling_r": two_opt_sampling_r,
             "avg": float("nan"),
             "best": float("nan"),
             "duration": float("nan"),
@@ -137,20 +181,27 @@ def _safe_run_mode(
 
 # Modes to compare:
 # (label, use_2opt, two_opt_mode, two_opt_kind,
-#  two_opt_knn_k, two_opt_radius, two_opt_radius_min, two_opt_radius_max)
+#  two_opt_knn_k, two_opt_radius, two_opt_radius_min, two_opt_radius_max,
+#  two_opt_decomp_radius, two_opt_sampling_base, two_opt_sampling_r)
 #
 # ``two_opt_radius`` is only consulted when ``two_opt_kind == 'radius'``;
 # ``None`` makes the dispatcher fall back to ``max(2, N // 10)`` per instance.
 # ``two_opt_radius_min`` / ``two_opt_radius_max`` are only consulted when
 # ``two_opt_kind == 'range_radius'``; ``None`` for either makes the dispatcher
 # fall back to ``(2, max(2, N // 10))``.
+# ``two_opt_decomp_radius`` is only consulted when ``two_opt_kind == 'decomp'``;
+# ``None`` makes the dispatcher fall back to ``max(2, revision_len // 10)``.
+# ``two_opt_sampling_base`` / ``two_opt_sampling_r`` are only consulted when
+# ``two_opt_kind == 'sampling_radius'``; defaults are ``2`` and ``None`` with
+# ``None`` for ``r`` making the dispatcher fall back to
+# ``max(2, N // 10)`` per instance.
 def make_modes(opts):
     """Build the comparison table once ``opts.problem_size`` is known.
 
     The wide-window range-radius rows scale with the instance size, so the
     MODES table is built per-call rather than at module load.
 
-    Returns a list of 8-tuples, one per comparison row. Each tuple has the
+    Returns a list of 11-tuples, one per comparison row. Each tuple has the
     following positional fields:
 
       0. ``label`` (str) — short name shown in the printed summary table,
@@ -158,7 +209,8 @@ def make_modes(opts):
          tag component. Must be unique across rows. The ``print_table``
          helper also infers the ``two_opt_kind`` from the label prefix:
          ``knn_*`` → ``knn``, ``range_*`` → ``range_radius``,
-         ``radius_*`` → ``radius``, anything else → ``full``.
+         ``sampling_*`` → ``sampling_radius``, ``radius_*`` → ``radius``,
+         ``decomp_*`` → ``decomp``, anything else → ``full``.
 
       1. ``use_2opt`` (bool) — master switch. When ``False`` the pipeline
          skips the optional 2-opt step entirely (this is the GLOP-only
@@ -168,10 +220,12 @@ def make_modes(opts):
       2. ``two_opt_mode`` (``'final'`` | ``'per_iter'``) — controls *when*
          the 2-opt runs. ``'final'`` runs it once after the whole revisor
          chain; ``'per_iter'`` runs it after every revisor iteration.
+         ``'decomp'`` is only valid with ``'per_iter'``.
 
       3. ``two_opt_kind`` (``'full'`` | ``'knn'`` | ``'radius'`` |
-         ``'range_radius'``) — selects the algorithm. Unknown values
-         trigger a ``UserWarning`` and fall back to ``'full'``.
+         ``'range_radius'`` | ``'sampling_radius'`` | ``'decomp'``) —
+         selects the algorithm. Unknown values trigger a ``UserWarning``
+         and fall back to ``'full'``.
 
       4. ``two_opt_knn_k`` (int | None) — ``k`` for KNN-sparse 2-opt.
          Only consulted when ``two_opt_kind == 'knn'``. ``None`` means the
@@ -195,6 +249,24 @@ def make_modes(opts):
          ``r_min > r_max`` it emits a ``UserWarning`` and silently swaps
          the two values.
 
+      8. ``two_opt_decomp_radius`` (int | None) — half-width of the seam
+         neighbourhood along the tour for ``two_opt_kind == 'decomp'``.
+         Only consulted for ``decomp`` rows. ``None`` means the dispatcher
+         falls back to ``max(2, revision_len // 10)``.
+
+      9. ``two_opt_sampling_base`` (int | None) — inclusive starting
+         offset for ``two_opt_kind == 'sampling_radius'``. Only consulted
+         for sampling-radius rows. ``None`` means the dispatcher falls
+         back to ``2``. Must be ``>= 2`` if supplied (offsets 0 and ±1
+         are invalid 2-opt moves).
+
+     10. ``two_opt_sampling_r`` (int | None) — window size beyond
+         ``two_opt_sampling_base`` for ``two_opt_kind == 'sampling_radius'``.
+         Only consulted for sampling-radius rows. ``None`` means the
+         dispatcher falls back to ``max(2, N // 10)``. If the dispatcher
+         finds ``base > r`` it emits a ``UserWarning`` and silently swaps
+         the two values.
+
     Downstream consumers all read rows positionally, so any change here is
     the only edit needed to add / remove / retune a comparison row:
 
@@ -208,15 +280,41 @@ def make_modes(opts):
     N = max(2, opts.problem_size // 10)  # problem_size_based
     C = max(2, opts.revision_lens[0])
     return [
-        # ("baseline", False, "final", "full", 20, None, None, None),
-        # ("final", True, "final", "full", 20, None, None, None),
-        # ("per_iter", True, "per_iter", "full", 20, None, None, None),
-        # ("knn_final", True, "final", "knn", 20, None, None, None),
-        # ("knn_per_iter", True, "per_iter", "knn", 20, None, None, None),
-        # ("radius_final", True, "final", "radius", 20, None, 0.5 * C, 1.5 * C),
-        ("radius_per_iter", True, "per_iter", "radius", 20, None, 0.5 * N, 2 * N),
-        # ("range_final", True, "final", "range_radius", 20, None, N, 3 * N),
-        # ("range_per_iter", True, "per_iter", "range_radius", 20, None, N, 3 * N),
+        (
+            "baseline",
+            False,
+            "final",
+            "full",
+            20,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,  # sampling_base, sampling_r
+        ),
+        # ("final", True, "final", "full", 20, None, None, None, None, None, None),
+        # ("per_iter", True, "per_iter", "full", 20, None, None, None, None, None, None),
+        # ("knn_final", True, "final", "knn", 20, None, None, None, None, None, None),
+        # ("knn_per_iter", True, "per_iter", "knn", 20, None, None, None, None, None, None),
+        # ("radius_final", True, "final", "radius", 20, None, 0.5 * C, 1.5 * C, None, None, None),
+        # ("radius_per_iter", True, "per_iter", "radius", 20, None, N, 2 * N, None, None, None),
+        # ("range_final", True, "final", "range_radius", 20, None, N, 3 * N, None, None, None),
+        # ("range_per_iter", True, "per_iter", "range_radius", 20, None, 0.5 * N, 5 * N, None, None, None,),
+        # ("decomp_per_iter_5",True,"per_iter", "decomp",20,None,None,None,5,  # Decomp radius sizeNone,None,  # sampling_base, sampling_r),
+        (
+            "sampling_per_iter_wide",
+            True,
+            "per_iter",
+            "sampling_radius",
+            20,
+            None,
+            None,
+            None,
+            None,
+            50,  # sampling_base
+            100,  # explicit wide window (N = 100)
+        ),
     ]
 
 
@@ -268,13 +366,17 @@ def build_base_opts():
         "--two_opt_kind",
         type=str,
         default="full",
-        choices=["full", "knn", "radius", "range_radius"],
+        choices=["full", "knn", "radius", "range_radius", "sampling_radius", "decomp"],
         help="2-opt algorithm variant: 'full' (dense), "
         "'knn' (k-NN-sparse; uses --two_opt_knn_k), "
         "'radius' (tour-position-sparse; uses --two_opt_radius), "
-        "or 'range_radius' (tour-position-sparse over "
+        "'range_radius' (tour-position-sparse over "
         "[r_min, r_max]; uses --two_opt_radius_min / "
-        "--two_opt_radius_max)",
+        "--two_opt_radius_max), "
+        "'sampling_radius' (shifting-window tour-position-sparse; "
+        "uses --two_opt_sampling_base / --two_opt_sampling_r), or "
+        "'decomp' (decomposition-aware; only valid with "
+        "--two_opt_mode=per_iter; uses --two_opt_decomp_radius).",
     )
     p.add_argument(
         "--two_opt_knn_k",
@@ -304,6 +406,30 @@ def build_base_opts():
         help="r_max for range-radius 2-opt (only used when "
         "--two_opt_kind=range_radius). Default: 10%% of "
         "--problem_size (floored at max(r_min, 2)).",
+    )
+    p.add_argument(
+        "--two_opt_sampling_base",
+        type=int,
+        default=2,
+        help="Starting offset for sampling-radius 2-opt (only used when "
+        "--two_opt_kind=sampling_radius). Default: 2.",
+    )
+    p.add_argument(
+        "--two_opt_sampling_r",
+        type=int,
+        default=None,
+        help="Window size beyond base for sampling-radius 2-opt (only "
+        "used when --two_opt_kind=sampling_radius). Default: 10%% of "
+        "--problem_size (floored at max(base, 2)).",
+    )
+    p.add_argument(
+        "--two_opt_decomp_radius",
+        type=int,
+        default=None,
+        help="r for decomp 2-opt — the seam neighbourhood "
+        "half-width along the tour (only used when "
+        "--two_opt_kind=decomp). Default: "
+        "max(2, revision_len // 10).",
     )
     p.add_argument(
         "--two_opt_debug",
@@ -369,6 +495,9 @@ def run_mode(
     two_opt_radius,
     two_opt_radius_min,
     two_opt_radius_max,
+    two_opt_decomp_radius,
+    two_opt_sampling_base,
+    two_opt_sampling_r,
     base_opts,
     revisers,
 ):
@@ -381,6 +510,9 @@ def run_mode(
     opts.two_opt_radius = two_opt_radius
     opts.two_opt_radius_min = two_opt_radius_min
     opts.two_opt_radius_max = two_opt_radius_max
+    opts.two_opt_decomp_radius = two_opt_decomp_radius
+    opts.two_opt_sampling_base = two_opt_sampling_base
+    opts.two_opt_sampling_r = two_opt_sampling_r
     opts.two_opt_debug = getattr(base_opts, "two_opt_debug", False)
     opts.record_two_opt_swaps = getattr(base_opts, "record_two_opt_swaps", False)
     # Always allocate a sink so downstream code can read it unconditionally;
@@ -397,7 +529,9 @@ def run_mode(
         f"(use_2opt={use_2opt}, mode={two_opt_mode}, "
         f"kind={two_opt_kind}, knn_k={two_opt_knn_k}, "
         f"radius={two_opt_radius}, "
-        f"r_min={two_opt_radius_min}, r_max={two_opt_radius_max}) "
+        f"r_min={two_opt_radius_min}, r_max={two_opt_radius_max}, "
+        f"decomp_r={two_opt_decomp_radius}, "
+        f"samp_base={two_opt_sampling_base}, samp_r={two_opt_sampling_r}) "
         f"====================="
     )
     results, duration, all_stats = _eval_dataset(opts.path, opts, opts.device, revisers)
@@ -410,6 +544,9 @@ def run_mode(
         "two_opt_radius": two_opt_radius,
         "two_opt_radius_min": two_opt_radius_min,
         "two_opt_radius_max": two_opt_radius_max,
+        "two_opt_decomp_radius": two_opt_decomp_radius,
+        "two_opt_sampling_base": two_opt_sampling_base,
+        "two_opt_sampling_r": two_opt_sampling_r,
         "avg": costs.mean().item(),
         "best": costs.min().item(),
         "duration": duration,
@@ -455,6 +592,9 @@ def plot_comparison(runs, opts):
         "range_per_iter": "#bcbd22",
         "range_wide_final": "#17becf",
         "range_wide_per_iter": "#9edae5",
+        "sampling_per_iter_default": "#aec7e8",
+        "sampling_per_iter_wide": "#ffbb78",
+        "decomp_per_iter": "#dbdb8d",
     }
     markers = {
         "baseline": "o",
@@ -468,6 +608,9 @@ def plot_comparison(runs, opts):
         "range_per_iter": "h",
         "range_wide_final": "<",
         "range_wide_per_iter": ">",
+        "sampling_per_iter_default": "*",
+        "sampling_per_iter_wide": "+",
+        "decomp_per_iter": "d",
     }
 
     fig, (ax1, ax2) = plt.subplots(
@@ -487,8 +630,8 @@ def plot_comparison(runs, opts):
             xs,
             ys,
             "-",
-            color=colors[r["label"]],
-            marker=markers[r["label"]],
+            color=colors.get(r["label"], _random_color(r["label"])),
+            marker=markers.get(r["label"], _random_marker(r["label"])),
             markersize=4,
             linewidth=1.8,
             label=f"{r['label']} (per-iter)",
@@ -499,13 +642,13 @@ def plot_comparison(runs, opts):
             [xs[-1], xs[-1] + 1],
             [ys[-1], r["avg"]],
             ":",
-            color=colors[r["label"]],
+            color=colors.get(r["label"], _random_color(r["label"])),
             linewidth=1.2,
         )
         ax1.scatter(
             [xs[-1] + 1],
             [r["avg"]],
-            color=colors[r["label"]],
+            color=colors.get(r["label"], _random_color(r["label"])),
             marker="*",
             s=130,
             zorder=5,
@@ -525,7 +668,12 @@ def plot_comparison(runs, opts):
     bests = [r["best"] for r in runs]
     base_avg = next((r["avg"] for r in runs if r["label"] == "baseline"), avgs[0])
     x = np.arange(len(labels))
-    bars = ax2.bar(x, avgs, color=[colors[l] for l in labels], alpha=0.85)
+    bars = ax2.bar(
+        x,
+        avgs,
+        color=[colors.get(l, _random_color(l)) for l in labels],
+        alpha=0.85,
+    )
     ax2.set_xticks(x)
     ax2.set_xticklabels(labels)
     ax2.set_ylabel("Final mean tour cost")
@@ -549,6 +697,8 @@ def plot_comparison(runs, opts):
     has_knn = any(r["label"].startswith("knn") for r in runs)
     has_radius = any(r["label"].startswith("radius") for r in runs)
     has_range = any(r["label"].startswith("range") for r in runs)
+    has_sampling = any(r["label"].startswith("sampling") for r in runs)
+    has_decomp = any(r["label"].startswith("decomp") for r in runs)
     kind_suffix = (
         f", kind={opts.two_opt_kind}"
         + (f", k={opts.two_opt_knn_k}" if opts.two_opt_kind == "knn" else "")
@@ -570,7 +720,25 @@ def plot_comparison(runs, opts):
             )
             else ""
         )
-        if (has_knn or has_radius or has_range)
+        + (
+            f", samp=[{getattr(opts, 'two_opt_sampling_base', 2)},"
+            f"{getattr(opts, 'two_opt_sampling_r', None)}]"
+            if (
+                opts.two_opt_kind == "sampling_radius"
+                and getattr(opts, "two_opt_sampling_base", None) is not None
+                and getattr(opts, "two_opt_sampling_r", None) is not None
+            )
+            else ""
+        )
+        + (
+            f", decomp_r={opts.two_opt_decomp_radius}"
+            if (
+                opts.two_opt_kind == "decomp"
+                and getattr(opts, "two_opt_decomp_radius", None) is not None
+            )
+            else ""
+        )
+        if (has_knn or has_radius or has_range or has_sampling or has_decomp)
         else ""
     )
     fig.suptitle(
@@ -586,6 +754,8 @@ def plot_comparison(runs, opts):
     has_knn = any(r["label"].startswith("knn") for r in runs)
     has_radius = any(r["label"].startswith("radius") for r in runs)
     has_range = any(r["label"].startswith("range") for r in runs)
+    has_sampling = any(r["label"].startswith("sampling") for r in runs)
+    has_decomp = any(r["label"].startswith("decomp") for r in runs)
     kind_tag = (
         f"_kind{opts.two_opt_kind}"
         + (f"_k{opts.two_opt_knn_k}" if opts.two_opt_kind == "knn" else "")
@@ -606,7 +776,24 @@ def plot_comparison(runs, opts):
             )
             else ""
         )
-        if (has_knn or has_radius or has_range)
+        + (
+            f"_sampb{opts.two_opt_sampling_base}_sampr{opts.two_opt_sampling_r}"
+            if (
+                opts.two_opt_kind == "sampling_radius"
+                and getattr(opts, "two_opt_sampling_base", None) is not None
+                and getattr(opts, "two_opt_sampling_r", None) is not None
+            )
+            else ""
+        )
+        + (
+            f"_decompr{opts.two_opt_decomp_radius}"
+            if (
+                opts.two_opt_kind == "decomp"
+                and getattr(opts, "two_opt_decomp_radius", None) is not None
+            )
+            else ""
+        )
+        if (has_knn or has_radius or has_range or has_sampling or has_decomp)
         else ""
     )
     tag = (
@@ -631,6 +818,8 @@ def _build_tag(opts):
     has_knn = any(r["label"].startswith("knn") for r in runs_for_tag)
     has_radius = any(r["label"].startswith("radius") for r in runs_for_tag)
     has_range = any(r["label"].startswith("range") for r in runs_for_tag)
+    has_sampling = any(r["label"].startswith("sampling") for r in runs_for_tag)
+    has_decomp = any(r["label"].startswith("decomp") for r in runs_for_tag)
     kind_tag = (
         f"_kind{opts.two_opt_kind}"
         + (f"_k{opts.two_opt_knn_k}" if opts.two_opt_kind == "knn" else "")
@@ -651,7 +840,24 @@ def _build_tag(opts):
             )
             else ""
         )
-        if (has_knn or has_radius or has_range)
+        + (
+            f"_sampb{opts.two_opt_sampling_base}_sampr{opts.two_opt_sampling_r}"
+            if (
+                opts.two_opt_kind == "sampling_radius"
+                and getattr(opts, "two_opt_sampling_base", None) is not None
+                and getattr(opts, "two_opt_sampling_r", None) is not None
+            )
+            else ""
+        )
+        + (
+            f"_decompr{opts.two_opt_decomp_radius}"
+            if (
+                opts.two_opt_kind == "decomp"
+                and getattr(opts, "two_opt_decomp_radius", None) is not None
+            )
+            else ""
+        )
+        if (has_knn or has_radius or has_range or has_sampling or has_decomp)
         else ""
     )
     return (
@@ -700,6 +906,9 @@ def plot_swap_distance_histograms(runs, opts):
         "range_per_iter": "#bcbd22",
         "range_wide_final": "#17becf",
         "range_wide_per_iter": "#9edae5",
+        "sampling_per_iter_default": "#aec7e8",
+        "sampling_per_iter_wide": "#ffbb78",
+        "decomp_per_iter": "#dbdb8d",
     }
 
     fig, (ax_abs, ax_norm) = plt.subplots(1, 2, figsize=(13, 5))
@@ -712,7 +921,7 @@ def plot_swap_distance_histograms(runs, opts):
 
     for r in plotted:
         d = r["swap_dists"]
-        color = colors.get(r["label"], None)
+        color = colors.get(r["label"], _random_color(r["label"]))
         ax_abs.hist(
             d,
             bins=n_bins_abs,
@@ -809,6 +1018,10 @@ def print_table(runs):
                 r["two_opt_kind"] = "knn"
             elif r["label"].startswith("range"):
                 r["two_opt_kind"] = "range_radius"
+            elif r["label"].startswith("sampling"):
+                r["two_opt_kind"] = "sampling_radius"
+            elif r["label"].startswith("decomp"):
+                r["two_opt_kind"] = "decomp"
             elif r["label"].startswith("radius"):
                 r["two_opt_kind"] = "radius"
             else:
@@ -847,9 +1060,33 @@ def main():
     modes = make_modes(opts)
     runs = [
         _safe_run_mode(
-            label, use2, mode, kind, knn_k, radius, r_min, r_max, opts, revisers
+            label,
+            use2,
+            mode,
+            kind,
+            knn_k,
+            radius,
+            r_min,
+            r_max,
+            decomp_r,
+            sampling_base,
+            sampling_r,
+            opts,
+            revisers,
         )
-        for (label, use2, mode, kind, knn_k, radius, r_min, r_max) in modes
+        for (
+            label,
+            use2,
+            mode,
+            kind,
+            knn_k,
+            radius,
+            r_min,
+            r_max,
+            decomp_r,
+            sampling_base,
+            sampling_r,
+        ) in modes
     ]
     skipped = [r["label"] for r in runs if r.get("skipped")]
     if skipped:

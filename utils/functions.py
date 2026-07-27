@@ -325,7 +325,10 @@ def LCP_TSP(
 
         # Optional: run 2-opt after each revisor iteration (per_iter mode).
         if getattr(opts, 'use_2opt', False) and getattr(opts, 'two_opt_mode', 'final') == 'per_iter':
-            seeds = maybe_two_opt(seeds, opts)
+            # revision_len is forwarded so the decomposition-aware variant
+            # (`two_opt_kind='decomp'`) knows which revisor layer this call
+            # belongs to; it is unused by every other kind.
+            seeds = maybe_two_opt(seeds, opts, revision_len=revision_len)
 
         # NEW: per-iteration logging — closed-loop tour cost across all --width restarts
         cost_iter = (seeds[:, 1:] - seeds[:, :-1]).norm(p=2, dim=2).sum(1) \

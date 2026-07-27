@@ -305,17 +305,23 @@ if __name__ == "__main__":
                         help='Enable 2-opt post-processing on the GLOP tour')
     parser.add_argument('--two_opt_mode', type=str, default='final', choices=['final', 'per_iter'],
                         help="2-opt evaluation mode: 'final' runs it once after the whole pipeline; "
-                             "'per_iter' runs it after each revisor iteration")
+                             "'per_iter' runs it after each revisor iteration. "
+                             "'--two_opt_kind=decomp' requires 'per_iter'.")
     parser.add_argument('--two_opt_iters', type=int, default=10,
                         help='Max number of 2-opt sweeps per invocation')
     parser.add_argument('--two_opt_kind', type=str, default='full',
-                        choices=['full', 'knn', 'radius', 'range_radius'],
+                        choices=['full', 'knn', 'radius', 'range_radius', 'sampling_radius', 'decomp'],
                         help="2-opt algorithm variant: 'full' (dense candidate set), "
                              "'knn' (k-NN-sparse; uses --two_opt_knn_k), "
                              "'radius' (tour-position-sparse; uses --two_opt_radius), "
-                             "or 'range_radius' (tour-position-sparse over "
+                             "'range_radius' (tour-position-sparse over "
                              "[r_min, r_max]; uses --two_opt_radius_min / "
-                             "--two_opt_radius_max)")
+                             "--two_opt_radius_max), "
+                             "'sampling_radius' (shifting-window tour-position-sparse; "
+                             "uses --two_opt_sampling_base / --two_opt_sampling_r), or "
+                             "'decomp' (decomposition-aware; only valid with "
+                             "--two_opt_mode=per_iter; uses "
+                             "--two_opt_decomp_radius).")
     parser.add_argument('--two_opt_knn_k', type=int, default=20,
                         help='k for KNN-sparse 2-opt (only used when --two_opt_kind=knn)')
     parser.add_argument('--two_opt_radius', type=int, default=None,
@@ -329,6 +335,18 @@ if __name__ == "__main__":
                         help='r_max for range-radius 2-opt (only used when '
                              '--two_opt_kind=range_radius). Default: 10%% of '
                              '--problem_size (floored at max(r_min, 2)).')
+    parser.add_argument('--two_opt_sampling_base', type=int, default=2,
+                        help='Starting offset for sampling-radius 2-opt (only used '
+                             'when --two_opt_kind=sampling_radius). Default: 2.')
+    parser.add_argument('--two_opt_sampling_r', type=int, default=None,
+                        help='Window size beyond base for sampling-radius 2-opt '
+                             '(only used when --two_opt_kind=sampling_radius). '
+                             'Default: 10%% of --problem_size (floored at max(base, 2)).')
+    parser.add_argument('--two_opt_decomp_radius', type=int, default=None,
+                        help='r for decomp 2-opt — the seam neighbourhood '
+                             'half-width along the tour (only used when '
+                             '--two_opt_kind=decomp). Default: '
+                             'max(2, revision_len // 10).')
     parser.add_argument('--two_opt_debug', action='store_true',
                         help='Print per-sweep 2-opt phase timings to stdout '
                              '(knn_graph construction, candidate extraction, '
