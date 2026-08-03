@@ -310,7 +310,7 @@ if __name__ == "__main__":
     parser.add_argument('--two_opt_iters', type=int, default=10,
                         help='Max number of 2-opt sweeps per invocation')
     parser.add_argument('--two_opt_kind', type=str, default='full',
-                        choices=['full', 'knn', 'radius', 'range_radius', 'sampling_radius', 'decomp'],
+                        choices=['full', 'knn', 'radius', 'range_radius', 'sampling_radius', 'hop_radius', 'decomp', 'decomp_sampling'],
                         help="2-opt algorithm variant: 'full' (dense candidate set), "
                              "'knn' (k-NN-sparse; uses --two_opt_knn_k), "
                              "'radius' (tour-position-sparse; uses --two_opt_radius), "
@@ -318,10 +318,18 @@ if __name__ == "__main__":
                              "[r_min, r_max]; uses --two_opt_radius_min / "
                              "--two_opt_radius_max), "
                              "'sampling_radius' (shifting-window tour-position-sparse; "
-                             "uses --two_opt_sampling_base / --two_opt_sampling_r), or "
+                             "uses --two_opt_sampling_base / --two_opt_sampling_r), "
+                             "'hop_radius' (hop-stride tour-position-sparse; "
+                             "uses --two_opt_hop_base / --two_opt_hop_h), "
                              "'decomp' (decomposition-aware; only valid with "
                              "--two_opt_mode=per_iter; uses "
-                             "--two_opt_decomp_radius).")
+                             "--two_opt_decomp_radius), or "
+                             "'decomp_sampling' (seam-initiated × far-distance "
+                             "composition; only valid with "
+                             "--two_opt_mode=per_iter; uses "
+                             "--two_opt_decomp_sampling_base / "
+                             "--two_opt_decomp_sampling_seam_radius / "
+                             "--two_opt_decomp_sampling_candidate_r).")
     parser.add_argument('--two_opt_knn_k', type=int, default=20,
                         help='k for KNN-sparse 2-opt (only used when --two_opt_kind=knn)')
     parser.add_argument('--two_opt_radius', type=int, default=None,
@@ -342,11 +350,35 @@ if __name__ == "__main__":
                         help='Window size beyond base for sampling-radius 2-opt '
                              '(only used when --two_opt_kind=sampling_radius). '
                              'Default: 10%% of --problem_size (floored at max(base, 2)).')
+    parser.add_argument('--two_opt_hop_base', type=int, default=2,
+                        help='Starting offset for hop-radius 2-opt (only used '
+                             'when --two_opt_kind=hop_radius). Default: 2.')
+    parser.add_argument('--two_opt_hop_h', type=int, default=None,
+                        help='Hop stride for hop-radius 2-opt (only used '
+                             'when --two_opt_kind=hop_radius). '
+                             'Default: 10%% of --problem_size (floored at 2).')
     parser.add_argument('--two_opt_decomp_radius', type=int, default=None,
                         help='r for decomp 2-opt — the seam neighbourhood '
                              'half-width along the tour (only used when '
                              '--two_opt_kind=decomp). Default: '
                              'max(2, revision_len // 10).')
+    parser.add_argument('--two_opt_decomp_sampling_base', type=int, default=2,
+                        help='Starting offset for the far-distance window in '
+                             'decomp_sampling 2-opt (only used when '
+                             '--two_opt_kind=decomp_sampling). Default: 2.')
+    parser.add_argument('--two_opt_decomp_sampling_seam_radius', type=int, default=None,
+                        help='r_seam for decomp_sampling 2-opt — the seam '
+                             'neighbourhood half-width along the tour (only '
+                             'used when --two_opt_kind=decomp_sampling). '
+                             'Default: max(2, revision_len // 10).')
+    parser.add_argument('--two_opt_decomp_sampling_candidate_r', type=int, default=None,
+                        help='r_candidate for decomp_sampling 2-opt — the '
+                             'far-distance window size (only used when '
+                             '--two_opt_kind=decomp_sampling). The actual '
+                             'destination set is [base + shift, '
+                             'base + shift + r_candidate + 1) and its '
+                             'negation. Default: 10%% of --problem_size '
+                             '(floored at 2).')
     parser.add_argument('--two_opt_debug', action='store_true',
                         help='Print per-sweep 2-opt phase timings to stdout '
                              '(knn_graph construction, candidate extraction, '

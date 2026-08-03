@@ -9,6 +9,7 @@ import os
 import sys
 import warnings
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,6 +19,8 @@ from utils import post_process as pp_mod
 from utils.post_process import (
     _knn_edges_scipy,
     _pyg_knn_graph,
+    decomp_sampling_2opt,
+    decomp_sampling_2opt_gain_matrix,
     knn_2opt_gain_matrix,
     radius_2opt,
     radius_2opt_gain_matrix,
@@ -1066,6 +1069,8 @@ def test_safe_run_mode_catches_oom_and_returns_sentinel():
 
         sentinel = e2._safe_run_mode(
             'knn_per_iter', True, 'per_iter', 'knn', 20, None, None, None,
+            None, None, None,  # decomp_radius, sampling_base, sampling_r
+            None, None, None,  # decomp_sampling_base, seam_radius, candidate_r
             _O(), revisers=[],
         )
     finally:
@@ -1097,7 +1102,9 @@ def test_safe_run_mode_propagates_non_oom():
         propagated = False
         try:
             e2._safe_run_mode('final', True, 'final', 'full', 20, None,
-                              None, None, _O(), revisers=[])
+                              None, None, None, None, None,
+                              None, None, None,
+                              _O(), revisers=[])
         except ValueError:
             propagated = True
     finally:
@@ -1121,7 +1128,9 @@ def test_safe_run_mode_propagates_keyboard_interrupt():
         propagated = False
         try:
             e2._safe_run_mode('per_iter', True, 'per_iter', 'full', 20, None,
-                              None, None, _O(), revisers=[])
+                              None, None, None, None, None,
+                              None, None, None,
+                              _O(), revisers=[])
         except KeyboardInterrupt:
             propagated = True
     finally:
@@ -1170,6 +1179,122 @@ def test_print_table_tolerates_oom_baseline():
     with contextlib.redirect_stdout(buf):
         e2.print_table(runs)
     assert 'OOM' in buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Decomp-sampling 2-opt tests
+# ---------------------------------------------------------------------------
+
+
+def test_decomp_sampling_gain_matrix_contract():
+    """Standard (tour, edge_gain, (src_b, src_i, dst_j)) contract."""
+    torch.manual_seed(200)
+    B, N = 2, 30
+    seeds = torch.rand(B, N, 2)
+    tour, edge_gain, idx_tuple = decomp_sampling_2opt_gain_matrix(
+        seeds, base=2, revision_len=10, r_seam=2, r_candidate=5
+    )
+    assert tour.shape == (B, N)
+    assert idx_tuple is not None and len(idx_tuple) == 3
+    src_b, src_i, dst_j = idx_tuple
+    assert src_b.shape == src_i.shape == dst_j.shape == edge_gain.shape
+    assert src_b.min().item() >= 0 and src_b.max().item() < B
+    assert src_i.min().item() >= 0 and src_i.max().item() < N
+    assert dst_j.min().item() >= 0 and dst_j.max().item() < N
+
+
+def test_decomp_sampling_source_restricted_to_seams():
+    """Every src_i lies in the seam neighbourhood of some boundary."""
+    torch.manual_seed(201)
+    seeds = torch.rand(1, 40, 2)
+    rl, r_seam = 10, 3
+    _, _, (src_b, src_i, _) = decomp_sampling_2opt_gain_matrix(
+        seeds, base=2, revision_len=rl, r_seam=r_seam, r_candidate=4
+    )
+    starts = torch.arange(0, 40 - 40 % rl + 1, rl)
+    expected = torch.unique(
+        ((starts[:, None] + torch.arange(-r_seam, r_seam + 1)) % 40).reshape(-1)
+    )
+    src_set = set(src_i[src_b == 0].unique().tolist())
+    exp_set = set(expected.tolist())
+    assert src_set <= exp_set, f"{src_set - exp_set} not in expected"
+
+
+def test_decomp_sampling_shape_roundtrip():
+    torch.manual_seed(202)
+    x = torch.rand(4, 50, 2)
+    out = decomp_sampling_2opt(x, iters=5, revision_len=10)
+    assert out.shape == x.shape
+
+
+def test_decomp_sampling_never_worsens_random():
+    """Tour cost is non-increasing across iterations."""
+    torch.manual_seed(203)
+    x = torch.rand(8, 50, 2)
+    c0 = tour_cost(x)
+    out = decomp_sampling_2opt(x, iters=15, revision_len=10)
+    c1 = tour_cost(out)
+    assert (c1 <= c0 + 1e-5).all(), (c0, c1)
+
+
+def test_decomp_sampling_requires_revision_len():
+    """Driver raises ValueError when revision_len is None."""
+    torch.manual_seed(204)
+    x = torch.rand(2, 30, 2)
+    with pytest.raises(ValueError):
+        decomp_sampling_2opt(x, iters=2)
+
+
+def test_decomp_sampling_gain_matrix_validates_inputs():
+    """Invalid base / r_seam / r_candidate raise ValueError."""
+    seeds = torch.rand(1, 30, 2)
+    with pytest.raises(ValueError):
+        decomp_sampling_2opt_gain_matrix(
+            seeds, base=1, revision_len=10, r_seam=2, r_candidate=5
+        )
+    with pytest.raises(ValueError):
+        decomp_sampling_2opt_gain_matrix(
+            seeds, base=2, revision_len=10, r_seam=1, r_candidate=5
+        )
+    with pytest.raises(ValueError):
+        decomp_sampling_2opt_gain_matrix(
+            seeds, base=2, revision_len=10, r_seam=2, r_candidate=0
+        )
+
+
+def test_maybe_two_opt_dispatch_decomp_sampling():
+    """'decomp_sampling' routes through the dispatcher in per_iter mode."""
+    torch.manual_seed(205)
+    x = torch.rand(2, 30, 2)
+    opts = _make_opts(
+        use_2opt=True,
+        two_opt_iters=3,
+        two_opt_mode='per_iter',
+        two_opt_kind='decomp_sampling',
+    )
+    out = maybe_two_opt(x, opts, revision_len=10)
+    assert out.shape == x.shape
+    # Per_iter mode should actually run decomp_sampling and improve the cost
+    # on a non-trivial random tour.
+    assert (tour_cost(out) < tour_cost(x) - 1e-3).all()
+
+
+def test_maybe_two_opt_decomp_sampling_warns_in_final_mode():
+    """'decomp_sampling' warns and skips in final mode (seams are per-iter)."""
+    torch.manual_seed(206)
+    x = torch.rand(2, 30, 2)
+    opts = _make_opts(
+        use_2opt=True,
+        two_opt_iters=3,
+        two_opt_kind='decomp_sampling',
+        two_opt_mode='final',
+    )
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        out = maybe_two_opt(x, opts, revision_len=10)
+        assert any('per_iter' in str(warning.message) for warning in w)
+    # Final mode skips → input returned unchanged.
+    assert torch.equal(out, x)
 
 
 if __name__ == "__main__":

@@ -83,6 +83,16 @@ Entry points
       ``(2, max(2, N // 10))`` when either arg is unset and warns + swaps
       if the bounds are inverted. Edge gains are aggregated per-instance
       via ``scatter_max``.
+    * ``hop_radius_2opt(seeds, iters=10, base, h)`` — hop-stride
+      tour-position-sparse variant. Each sweep evaluates offsets
+      ``{base, base+h, base+2h, ..., base+(k-1)*h}`` (and their negatives),
+      where ``k = (N - base - 1) // 2 // h``. Successive sweeps use the
+      same offset set (no random shift), so the per-call cost
+      ``O(B * N * k)`` buys sparse coverage of a broader offset range
+      than a single dense fixed window. ``base`` must be ``>= 2`` and
+      ``h`` must be ``>= 1``; the dispatcher defaults to
+      ``(2, max(2, N // 10))`` when either arg is unset. Edge gains are
+      aggregated per-instance via ``scatter_max``.
     * ``decomp_2opt(seeds, iters=10, revision_len, r)`` — decomposition-aware
       variant that targets the edges *the GLOP revisor never re-optimises*:
       the seams between revisor windows. The candidate NODE set is every
@@ -98,9 +108,10 @@ Entry points
     * ``maybe_two_opt(seeds, opts, revision_len=None)`` — opts-gated wrapper
       used by the pipeline. Dispatches on ``opts.two_opt_kind`` (``"full"``,
       ``"knn"``, ``"radius"``, ``"range_radius"``, ``"sampling_radius"``,
-      or ``"decomp"``); unknown values fall back to ``"full"`` with a
-      ``UserWarning``. ``revision_len`` is forwarded by the per-iter call
-      site so the ``"decomp"`` kind knows which revisor layer it belongs to.
+      ``"hop_radius"``, or ``"decomp"``); unknown values fall back to
+      ``"full"`` with a ``UserWarning``. ``revision_len`` is forwarded by
+      the per-iter call site so the ``"decomp"`` kind knows which revisor
+      layer it belongs to.
 
 Implementation notes
     * The KNN gain matrix computes the four endpoint distances per edge
@@ -120,7 +131,7 @@ and ``LCP_TSP``) and ``main.py`` respectively. CLI flags:
 
     * ``--use_2opt`` — master switch.
     * ``--two_opt_kind {full, knn, radius, range_radius, sampling_radius,
-      decomp}`` — which algorithm to dispatch.
+      hop_radius, decomp, decomp_sampling}`` — which algorithm to dispatch.
     * ``--two_opt_mode {final, per_iter}`` — run once after the whole pipeline
       (``"final"``) or after every revisor iteration (``"per_iter"``).
       ``"decomp"`` is only valid with ``"per_iter"``; the dispatcher warns
@@ -135,9 +146,21 @@ and ``LCP_TSP``) and ``main.py`` respectively. CLI flags:
     * ``--two_opt_sampling_base`` / ``--two_opt_sampling_r`` — starting offset
       and window size for ``"sampling_radius"`` (defaults ``2`` and
       ``None``; ``None`` for ``r`` means 10% of ``--problem_size``).
+    * ``--two_opt_hop_base`` / ``--two_opt_hop_h`` — starting offset and
+      hop stride for ``"hop_radius"`` (defaults ``2`` and ``None``;
+      ``None`` for ``h`` means 10% of ``--problem_size`` floored at 2;
+      ignored unless ``two_opt_kind == "hop_radius"``).
     * ``--two_opt_decomp_radius`` — ``r`` (seam-neighbourhood half-width
       along the tour) for ``"decomp"`` (default ``None``, meaning
       ``max(2, revision_len // 10)``; ignored otherwise).
+    * ``--two_opt_decomp_sampling_base`` / ``--two_opt_decomp_sampling_seam_radius``
+      / ``--two_opt_decomp_sampling_candidate_r`` — starting offset,
+      seam-neighbourhood half-width, and far-offset window size for
+      ``"decomp_sampling"`` (defaults ``2``, ``None``, ``None``; ``None``
+      for the latter two means ``max(2, revision_len // 10)`` and
+      ``max(2, N // 10)`` respectively). ``"decomp_sampling"`` is only
+      valid with ``--two_opt_mode=per_iter``; the dispatcher warns and
+      skips in ``"final"`` mode.
     * ``--two_opt_debug`` — print per-sweep phase timings to stdout for
       performance investigation.
 
@@ -1294,6 +1317,284 @@ def sampling_radius_2opt(seeds, iters=10, base=None, r=None, debug=False, record
     return seeds
 
 
+def hop_radius_2opt_gain_matrix(seeds, base, h, times=None):
+    # Evaluate the gain of 2-opt flips on a TSP tour for candidate edges
+    # whose *tour-position* offset is *hop-strided*: every ``h`` hops
+    # starting at ``base`` — i.e. offsets
+    # ``{base, base+h, base+2h, ..., base+(k-1)*h}`` (and the symmetric
+    # negative offsets), where ``k = (N - base - 1) // 2 // h``. This
+    # is the hop-stride analogue of ``sampling_radius_2opt_gain_matrix``:
+    # instead of a contiguous window that shifts per call, the candidate
+    # set is a regular strided sample over the same ``[base, N//2]``
+    # budget — so the per-call cost is ``O(B * N * k)`` with ``k``
+    # playing the role of ``r + 1`` from sampling_radius. Successive
+    # sweeps use the same offset set (no random shift), so the benefit
+    # comes from sparse coverage of a broader offset range at lower
+    # per-call cost than a single dense fixed window.
+    #
+    # Mirrors the return contract of every other sparse variant:
+    # ``(tour, edge_gain, (src_b, src_i, dst_j))`` so the same driver
+    # code can aggregate per-instance gains via ``scatter_max``.
+    #
+    # ``times`` is an optional mutable dict populated (when not None)
+    # with per-phase millisecond timings: ``radius``, ``gather``,
+    # ``distance``, ``mask``. Useful for ``--two_opt_debug`` profiling.
+    if base < 2:
+        raise ValueError(
+            f"hop_radius_2opt_gain_matrix: base={base} must be >= 2 "
+            "(offsets 0 and ±1 are invalid 2-opt moves)."
+        )
+    if h < 1:
+        raise ValueError(
+            f"hop_radius_2opt_gain_matrix: h={h} must be >= 1 "
+            "(hop stride must be positive so the offset set is non-empty)."
+        )
+
+    device = seeds.device
+    B, N, D = seeds.shape
+
+    # Fixed coordinates and input tour
+    coords = seeds  # (B, N, D)
+    tour = torch.arange(N, device=device).expand(B, N).clone()  # (B, N), index
+
+    # Tour and successor in tour order
+    t = tour  # (B, N), index
+    t_next = torch.roll(t, shifts=-1, dims=1)  # (B, N), index, successor in closed tour
+
+    # Phase: hop-stride candidate construction.
+    # Per base position i in [0, N), candidate destinations are
+    # j = (i + s) mod N for s in {base, base+h, base+2h, ..., base+(k-1)*h}
+    # (and their negatives). Offsets are regularly strided over the
+    # same [base, N//2] budget that range_radius covers densely, so
+    # k plays the role of (r + 1) from sampling_radius.
+    _cuda_sync_if_available()
+    t0 = time.perf_counter()
+    k = (N - base - 1) // (2 * h)  # 0-index number of positive offsets
+    # sample index that are within a certain hop from each other
+    idx = base + h * torch.arange(k, device=device)
+    offsets = torch.cat([idx, -idx], dim=0)  # (2*k,)
+    I = torch.arange(N, device=device)  # (N,)
+    J = (I.unsqueeze(1) + offsets) % N  # (N, 2*k)
+    I_tiled = I.unsqueeze(1).expand_as(J)  # (N, 2*k)
+
+    # Empty-candidate guard (mirror the decomp_2opt "L < 2" early-exit):
+    # when (base, h, N) admits no hop, return empty so the driver
+    # short-circuits.
+    if k == 0:
+        if times is not None:
+            times["radius"] = (
+                times.get("radius", 0.0) + (time.perf_counter() - t0) * 1000
+            )
+        return (
+            tour,
+            torch.empty(0, device=device),
+            (
+                torch.empty(0, dtype=torch.long, device=device),
+                torch.empty(0, dtype=torch.long, device=device),
+                torch.empty(0, dtype=torch.long, device=device),
+            ),
+        )
+
+    # The (src_i, dst_j) edges are the same for every batch instance, so
+    # tile them B times to give one (src_i, dst_j) block per batch element.
+    # Order: batch-major, then row-major within a block (matches knn_2opt).
+    src_i = I_tiled.reshape(-1).repeat(B)  # (E,)
+    dst_j = J.reshape(-1).repeat(B)  # (E,)
+    E_per_b = N * 2 * k
+    src_b = torch.arange(B, device=device).repeat_interleave(E_per_b)
+    _cuda_sync_if_available()
+    if times is not None:
+        times["radius"] = times.get("radius", 0.0) + (time.perf_counter() - t0) * 1000
+
+    # Compute 2-opt gains for these (b, i, j).
+    # Old edges: (t_i, t_{i+1}) and (t_j, t_{j+1})
+    ti = t[src_b, src_i]  # advanced indexing per edge
+    tip1 = t_next[src_b, src_i]
+    tj = t[src_b, dst_j]
+    tjp1 = t_next[src_b, dst_j]
+
+    # Phase: gather (E, 4, D) endpoint coords.
+    _cuda_sync_if_available()
+    t0 = time.perf_counter()
+    node_idx = torch.stack([ti, tip1, tj, tjp1], dim=1)  # (E, 4)
+    pts = coords[src_b[:, None], node_idx]  # (E, 4, D)
+    _cuda_sync_if_available()
+    if times is not None:
+        times["gather"] = times.get("gather", 0.0) + (time.perf_counter() - t0) * 1000
+
+    # Phase: per-edge distance computation (4 lengths).
+    _cuda_sync_if_available()
+    t0 = time.perf_counter()
+
+    def _len(a, b):
+        return (pts[:, a] - pts[:, b]).pow(2).sum(dim=-1).sqrt()
+
+    old1 = _len(0, 1)  # |t_i -- t_{i+1}|
+    old2 = _len(2, 3)  # |t_j -- t_{j+1}|
+    new1 = _len(0, 2)  # |t_i -- t_j|
+    new2 = _len(1, 3)  # |t_{i+1} -- t_{j+1}|
+    edge_gain = old1 + old2 - new1 - new2  # (E,)
+    _cuda_sync_if_available()
+    if times is not None:
+        times["distance"] = (
+            times.get("distance", 0.0) + (time.perf_counter() - t0) * 1000
+        )
+
+    # Phase: adjacency / wrap-around mask.
+    # The hop set ``base, base+h, ...`` always excludes offset ±1
+    # (``base >= 2`` by construction), but the wrap-around pair
+    # (i=0, j=N-1) still surfaces once per instance via the +s=N-1
+    # offset on i=0 and must be masked.
+    _cuda_sync_if_available()
+    t0 = time.perf_counter()
+    invalid_e = (dst_j <= src_i + 1) | ((src_i == 0) & (dst_j == N - 1))  # (E,)
+    edge_gain = edge_gain.masked_fill(invalid_e, -1e9)
+    _cuda_sync_if_available()
+    if times is not None:
+        times["mask"] = times.get("mask", 0.0) + (time.perf_counter() - t0) * 1000
+
+    # Return per-edge gains plus the corresponding (b, i, j) for the driver.
+    return tour, edge_gain, (src_b, src_i, dst_j)
+
+
+def hop_radius_2opt(seeds, iters=10, base=None, h=None, debug=False, record=None):
+    # Best-improvement 2-opt with a *tour-position* sparse candidate set
+    # whose offsets are *hop-strided* (every ``h`` hops, starting at
+    # ``base``): the candidate set is
+    # ``{base, base+h, base+2h, ..., base+(k-1)*h}`` and the symmetric
+    # negative offsets, where ``k = (N - base - 1) // 2 // h``. Mirrors
+    # ``sampling_radius_2opt`` line-for-line, swapping the shifting-window
+    # candidate builder for the hop-stride builder.
+    #
+    # ``base`` is the smallest hop offset; must be >= 2 (offsets 0 and
+    # ±1 are invalid 2-opt moves and are masked out anyway). ``h`` is
+    # the hop stride — the gap between consecutive offsets. Library
+    # callers may pass both args; the dispatcher (``maybe_two_opt``)
+    # fills sensible defaults ``(2, max(2, N // 10))`` when called from
+    # the CLI.
+    device = seeds.device
+    B, N, D = seeds.shape
+
+    # Library-direct default fallback. The dispatcher applies its own
+    # policy first; this catches library callers (e.g. notebooks) that
+    # pass neither arg. There is no swap-and-warn when ``base > h``:
+    # ``h`` is a stride, not a width, so the pairing is meaningful
+    # rather than contradictory.
+    if base is None and h is None:
+        base, h = 2, max(2, N // 10)
+    elif base is None:
+        base = 2
+    elif h is None:
+        h = max(base, max(2, N // 10))
+
+    seeds = seeds.clone()
+
+    # ``times`` accumulates per-phase ms across the whole run; reset each sweep
+    # by summing existing keys. Used for `--two_opt_debug` profiling.
+    times = {} if debug else None
+
+    sweep_idx = 0
+    while sweep_idx < iters:
+        sweep_idx += 1
+        gain_times = {} if debug else None
+        _cuda_sync_if_available()
+        sweep_t0 = time.perf_counter()
+
+        tour, edge_gain, idx_tuple = hop_radius_2opt_gain_matrix(
+            seeds=seeds, base=base, h=h, times=gain_times
+        )
+        if idx_tuple is None or edge_gain.numel() == 0:
+            if debug:
+                _print_debug_timings(
+                    "hop_radius_2opt",
+                    sweep_idx,
+                    gain_times,
+                    times,
+                    sweep_t0,
+                    0,
+                )
+            break
+
+        src_b, src_i, dst_j = idx_tuple
+        n_edges = edge_gain.numel()
+
+        # Phase: scatter_max + best_i / best_j extraction.
+        _cuda_sync_if_available()
+        t0 = time.perf_counter()
+        best_gain, argmax = scatter_max(src=edge_gain, index=src_b)
+        best_i = src_i[argmax]
+        best_j = dst_j[argmax]
+        _cuda_sync_if_available()
+        if debug:
+            gain_times["scatter_max"] = (time.perf_counter() - t0) * 1000
+
+        # Early exit with no 2-opt gains
+        if (best_gain <= 0).all():
+            if debug:
+                _print_debug_timings(
+                    "hop_radius_2opt",
+                    sweep_idx,
+                    gain_times,
+                    times,
+                    sweep_t0,
+                    0,
+                    n_edges=n_edges,
+                )
+            break
+
+        # Record the cyclic short-arc distance min(|i-j|, N-|i-j|) for each
+        # accepted move. Vectorised: best_i/best_j are already (B,) tensors
+        # on-device. The TSP tour is closed, so we take the smaller of the
+        # forward-hop and the wrap-around-hop.
+        if record is not None:
+            accepted = best_gain > 0
+            if accepted.any():
+                d = (best_i - best_j).abs()
+                d = torch.minimum(d, N - d)
+                record.extend(d[accepted].tolist())
+
+        # Phase: per-batch Python loop applying the segment reversal.
+        _cuda_sync_if_available()
+        t0 = time.perf_counter()
+        new_tour = tour.clone()
+        n_accepted = 0
+        for b in range(B):
+            if best_gain[b] <= 0:
+                continue
+            i = best_i[b].item()
+            j = best_j[b].item()
+            t_b = tour[b]
+            new_tour[b] = torch.cat(
+                [t_b[: i + 1], torch.flip(t_b[i + 1 : j + 1], dims=[0]), t_b[j + 1 :]],
+                dim=0,
+            )
+            n_accepted += 1
+        _cuda_sync_if_available()
+        if debug:
+            gain_times["apply_loop"] = (time.perf_counter() - t0) * 1000
+
+        # Phase: final seeds reorder via gather(1, ...).
+        _cuda_sync_if_available()
+        t0 = time.perf_counter()
+        seeds = seeds.gather(1, new_tour.unsqueeze(-1).expand(B, N, D))
+        _cuda_sync_if_available()
+        if debug:
+            gain_times["reorder"] = (time.perf_counter() - t0) * 1000
+
+        if debug:
+            _print_debug_timings(
+                "hop_radius_2opt",
+                sweep_idx,
+                gain_times,
+                times,
+                sweep_t0,
+                n_accepted,
+                n_edges=n_edges,
+            )
+
+    return seeds
+
+
 def knn_2opt(seeds, iters=10, k=20, debug=False, record=None):
     device = seeds.device
     B, N, D = seeds.shape
@@ -1671,6 +1972,330 @@ def decomp_2opt(seeds, iters=10, revision_len=None, r=None, debug=False, record=
     return seeds
 
 
+def decomp_sampling_2opt_gain_matrix(
+    seeds, base, revision_len, r_seam, r_candidate, times=None
+):
+    # Evaluate 2-opt gains for the *seam-initiated, far-distance* candidate
+    # set used by ``decomp_sampling_2opt``. This is the composition of
+    # ``decomp_2opt_gain_matrix`` (seam-neighbourhood source nodes) and
+    # ``sampling_radius_2opt_gain_matrix`` (far-distance destinations via
+    # signed, shifted offsets).
+    #
+    # Source nodes ``I`` are the unique seam-neighbourhood positions
+    # (every tour position within ``r_seam`` hops of any decomposition
+    # boundary, deduplicated). Each source ``i`` jumps to destinations
+    # ``(i + s) % N`` for ``s`` in ``[base+shift, base+shift+r_candidate+1)``
+    # (inclusive upper bound, matching ``sampling_radius_2opt_gain_matrix``)
+    # and the symmetric negatives, where ``shift`` is re-sampled uniformly
+    # per call. The signed-offset set covers the long-arc half of the tour
+    # (``|s| >= N//2`` would be overlapping on the short arc), so the
+    # ``shift_max = max(0, N//2 - base - r_candidate)`` clamp keeps the
+    # window non-degenerate.
+    #
+    # Targets seam-induced long-range crossings that the GLOP revisor
+    # cannot fix (the revisor optimizes within a window of size
+    # ``revision_len``; anything outside that window, especially across
+    # seams, is unreachable). The combination restricts swap sources to
+    # the seam neighbourhood — where revisor-induced crossings are most
+    # likely — while still reaching far enough destinations to fix
+    # long-range seam crossings.
+    #
+    # Returns ``(tour, edge_gain, (src_b, src_i, dst_j))`` — the same
+    # contract used by every other sparse variant so the driver can
+    # share the per-instance ``scatter_max`` aggregation and per-batch
+    # reversal loop. ``times`` (when not ``None``) is populated with the
+    # ``radius`` (Phase 1 + Phase 2), ``gather``, ``distance``, and
+    # ``mask`` keys.
+    if revision_len is None:
+        raise ValueError(
+            "decomp_sampling_2opt_gain_matrix: revision_len must be provided "
+            "(seams are defined per revisor layer)."
+        )
+    if base < 2:
+        raise ValueError(
+            f"decomp_sampling_2opt_gain_matrix: base={base} must be >= 2 "
+            "(offsets 0 and ±1 are invalid 2-opt moves)."
+        )
+    if r_seam < 2:
+        raise ValueError(
+            f"decomp_sampling_2opt_gain_matrix: r_seam={r_seam} must be >= 2 "
+            "(offsets 0 and ±1 are invalid 2-opt moves)."
+        )
+    if r_candidate < 1:
+        raise ValueError(
+            f"decomp_sampling_2opt_gain_matrix: r_candidate={r_candidate} "
+            "must be >= 1 (otherwise the offset set is empty)."
+        )
+
+    device = seeds.device
+    B, N, D = seeds.shape
+
+    coords = seeds  # (B, N, D)
+    tour = torch.arange(N, device=device).expand(B, N).clone()  # (B, N), index
+    t = tour
+    t_next = torch.roll(t, shifts=-1, dims=1)  # successor in closed tour
+
+    # --- Phase 1: seam-neighbourhood source nodes --------------------------
+    # Boundary NODE positions: {0, RL, 2*RL, ..., (num_chunks-1)*RL}, plus
+    # the trailing segment start ``N - offset`` when ``offset != 0``.
+    # Same construction as ``decomp_2opt_gain_matrix``.
+    _cuda_sync_if_available()
+    t0 = time.perf_counter()
+    offset = N % revision_len
+    starts = torch.arange(0, N - offset + 1, revision_len, device=device)
+    delta = torch.arange(-r_seam, r_seam + 1, device=device)  # (2r_seam+1,)
+    locs = ((starts[:, None] + delta[None, :]) % N).reshape(-1)
+    locs = torch.unique(locs)
+    L = locs.numel()
+
+    # --- Phase 2: far-distance destinations (sampled per call) ------------
+    # Re-sampled sliding window of signed offsets so successive sweeps
+    # cover a broader effective offset range. Clamp to ``N//2 - base - r_candidate``
+    # so the window stays in the long-arc half (the ±symmetry would
+    # otherwise double-count short arcs).
+    shift_max = max(
+        0, N // 2 - base - r_candidate
+    )  # OG: shift_max = max(0, N // 2 - base - r_candidate)
+    if shift_max > 0:
+        shift = int(torch.randint(0, shift_max, size=()).item())
+    else:
+        shift = 0
+    offsets = torch.arange(
+        base + shift, base + shift + r_candidate + 1, device=device
+    )  # (r_candidate+1,)
+    offsets = torch.cat([offsets, -offsets], dim=0)  # (2*(r_candidate+1),)
+
+    # --- Empty-candidate guard -------------------------------------------
+    # If the seam set is too small OR the offset set is empty, return
+    # empty gain so the driver short-circuits.
+    if L < 2 or offsets.numel() == 0:
+        if times is not None:
+            times["radius"] = (
+                times.get("radius", 0.0) + (time.perf_counter() - t0) * 1000
+            )
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return (
+            tour,
+            torch.empty(0, device=device),
+            (empty, empty, empty),
+        )
+
+    # --- Candidate EDGES: every seam node × every far offset --------------
+    # Note: ``I`` is the *seam* set, NOT ``arange(N)`` — that was a bug
+    # in the original stub that effectively reduced this strategy to a
+    # global sampling-radius search over all N nodes. With seam-restricted
+    # sources, the candidate set is the directed cross-product
+    # ``{i} × {(i + s) % N : s in offsets}``.
+    I = locs  # (L,)
+    J = (I.unsqueeze(1) + offsets) % N  # (L, 2*(r_candidate+1))
+    I_tiled = I.unsqueeze(1).expand_as(J)  # (L, 2*(r_candidate+1))
+
+    src_i = I_tiled.reshape(-1).repeat(B)  # (E,)
+    dst_j = J.reshape(-1).repeat(B)  # (E,)
+    E_per_b = L * offsets.numel()
+    src_b = torch.arange(B, device=device).repeat_interleave(E_per_b)
+
+    _cuda_sync_if_available()
+    if times is not None:
+        times["radius"] = times.get("radius", 0.0) + (time.perf_counter() - t0) * 1000
+
+    # --- Phase: gather (E, 4, D) endpoint coords --------------------------
+    _cuda_sync_if_available()
+    t0 = time.perf_counter()
+    ti = t[src_b, src_i]
+    tip1 = t_next[src_b, src_i]
+    tj = t[src_b, dst_j]
+    tjp1 = t_next[src_b, dst_j]
+    node_idx = torch.stack([ti, tip1, tj, tjp1], dim=1)  # (E, 4)
+    pts = coords[src_b[:, None], node_idx]  # (E, 4, D)
+    _cuda_sync_if_available()
+    if times is not None:
+        times["gather"] = times.get("gather", 0.0) + (time.perf_counter() - t0) * 1000
+
+    # --- Phase: per-edge gain computation --------------------------------
+    _cuda_sync_if_available()
+    t0 = time.perf_counter()
+
+    def _len(a, b):
+        return (pts[:, a] - pts[:, b]).pow(2).sum(dim=-1).sqrt()
+
+    old1 = _len(0, 1)  # |t_i -- t_{i+1}|
+    old2 = _len(2, 3)  # |t_j -- t_{j+1}|
+    new1 = _len(0, 2)  # |t_i -- t_j|
+    new2 = _len(1, 3)  # |t_{i+1} -- t_{j+1}|
+    edge_gain = old1 + old2 - new1 - new2  # (E,)
+    _cuda_sync_if_available()
+    if times is not None:
+        times["distance"] = (
+            times.get("distance", 0.0) + (time.perf_counter() - t0) * 1000
+        )
+
+    # --- Phase: adjacency / wrap-around mask -----------------------------
+    # The signed offsets mean ``dst_j`` may be ``<= src_i`` even when
+    # ``dst_j != src_i + 1 mod N``; this mask is the same as the one in
+    # ``sampling_radius_2opt_gain_matrix`` (no ``dst_j <= src_i`` defensive
+    # redundancy, since the ±offsets make that test redundant with the
+    # first disjunct only when ``dst_j > src_i``).
+    _cuda_sync_if_available()
+    t0 = time.perf_counter()
+    invalid_e = (dst_j <= src_i + 1) | ((src_i == 0) & (dst_j == N - 1))
+    edge_gain = edge_gain.masked_fill(invalid_e, -1e9)
+    _cuda_sync_if_available()
+    if times is not None:
+        times["mask"] = times.get("mask", 0.0) + (time.perf_counter() - t0) * 1000
+
+    return tour, edge_gain, (src_b, src_i, dst_j)
+
+
+def decomp_sampling_2opt(
+    seeds,
+    iters=10,
+    base=None,
+    revision_len=None,
+    r_seam=None,
+    r_candidate=None,
+    debug=False,
+    record=None,
+):
+    # Best-improvement 2-opt with the *seam-initiated, far-distance*
+    # candidate set built in ``decomp_sampling_2opt_gain_matrix``. Mirrors
+    # ``decomp_2opt`` (and ``sampling_radius_2opt``) line-for-line; the
+    # only algorithmic difference is the candidate-set construction.
+    #
+    # ``revision_len`` is the *current* revisor layer's window length and
+    # defines where the seams land in the reassembled tour frame. It is
+    # mandatory — seams have no meaning outside a revisor layer.
+    #
+    # Defaults (applied here AND in the dispatcher; the dispatcher wins
+    # so CLI args are honoured):
+    #   base        = 2
+    #   r_seam      = max(2, revision_len // 10)
+    #   r_candidate = max(2, N // 10)
+    device = seeds.device
+    B, N, D = seeds.shape
+
+    if revision_len is None:
+        raise ValueError(
+            "decomp_sampling_2opt: revision_len must be provided "
+            "(seams are defined per revisor layer)."
+        )
+
+    if base is None:
+        base = 2
+    if r_seam is None:
+        r_seam = max(2, revision_len // 10)
+    if r_candidate is None:
+        r_candidate = max(2, N // 10)
+
+    seeds = seeds.clone()
+
+    times = {} if debug else None
+
+    sweep_idx = 0
+    while sweep_idx < iters:
+        sweep_idx += 1
+        gain_times = {} if debug else None
+        _cuda_sync_if_available()
+        sweep_t0 = time.perf_counter()
+
+        tour, edge_gain, idx_tuple = decomp_sampling_2opt_gain_matrix(
+            seeds=seeds,
+            base=base,
+            revision_len=revision_len,
+            r_seam=r_seam,
+            r_candidate=r_candidate,
+            times=gain_times,
+        )
+        if idx_tuple is None or edge_gain.numel() == 0:
+            if debug:
+                _print_debug_timings(
+                    "decomp_sampling_2opt",
+                    sweep_idx,
+                    gain_times,
+                    times,
+                    sweep_t0,
+                    0,
+                )
+            break
+
+        src_b, src_i, dst_j = idx_tuple
+        n_edges = edge_gain.numel()
+
+        # Phase: scatter_max + best_i / best_j extraction.
+        _cuda_sync_if_available()
+        t0 = time.perf_counter()
+        best_gain, argmax = scatter_max(src=edge_gain, index=src_b)
+        best_i = src_i[argmax]
+        best_j = dst_j[argmax]
+        _cuda_sync_if_available()
+        if debug:
+            gain_times["scatter_max"] = (time.perf_counter() - t0) * 1000
+
+        # Early exit with no 2-opt gains.
+        if (best_gain <= 0).all():
+            if debug:
+                _print_debug_timings(
+                    "decomp_sampling_2opt",
+                    sweep_idx,
+                    gain_times,
+                    times,
+                    sweep_t0,
+                    0,
+                    n_edges=n_edges,
+                )
+            break
+
+        # Record the cyclic short-arc distance min(|i-j|, N-|i-j|) for
+        # each accepted move (same convention as the other variants).
+        if record is not None:
+            accepted = best_gain > 0
+            if accepted.any():
+                d = (best_i - best_j).abs()
+                d = torch.minimum(d, N - d)
+                record.extend(d[accepted].tolist())
+
+        # Phase: per-batch Python loop applying the segment reversal.
+        _cuda_sync_if_available()
+        t0 = time.perf_counter()
+        new_tour = tour.clone()
+        n_accepted = 0
+        for b in range(B):
+            if best_gain[b] <= 0:
+                continue
+            i = best_i[b].item()
+            j = best_j[b].item()
+            t_b = tour[b]
+            new_tour[b] = torch.cat(
+                [t_b[: i + 1], torch.flip(t_b[i + 1 : j + 1], dims=[0]), t_b[j + 1 :]],
+                dim=0,
+            )
+            n_accepted += 1
+        _cuda_sync_if_available()
+        if debug:
+            gain_times["apply_loop"] = (time.perf_counter() - t0) * 1000
+
+        # Phase: final seeds reorder via gather(1, ...).
+        _cuda_sync_if_available()
+        t0 = time.perf_counter()
+        seeds = seeds.gather(1, new_tour.unsqueeze(-1).expand(B, N, D))
+        _cuda_sync_if_available()
+        if debug:
+            gain_times["reorder"] = (time.perf_counter() - t0) * 1000
+
+        if debug:
+            _print_debug_timings(
+                "decomp_sampling_2opt",
+                sweep_idx,
+                gain_times,
+                times,
+                sweep_t0,
+                n_accepted,
+                n_edges=n_edges,
+            )
+
+    return seeds
+
+
 def maybe_two_opt(seeds, opts, revision_len=None):
     """Optionally run 2-opt on a (B, N, D) coordinate tour, gated by opts.
 
@@ -1710,6 +2335,23 @@ def maybe_two_opt(seeds, opts, revision_len=None):
       decomposition-aware 2-opt. When ``None`` the dispatcher falls back to
       ``max(2, revision_len // 10)`` (only consulted when ``two_opt_kind ==
       "decomp"``).
+    * ``opts.two_opt_decomp_sampling_base`` (int or ``None``, default
+      ``None``) — starting offset for the far-distance window in the
+      decomposition+sampling composition. When ``None`` the dispatcher
+      falls back to ``2`` (only consulted when ``two_opt_kind ==
+      "decomp_sampling"``).
+    * ``opts.two_opt_decomp_sampling_seam_radius`` (int or ``None``, default
+      ``None``) — half-width of the seam neighbourhood along the tour for
+      the decomposition+sampling composition. When ``None`` the dispatcher
+      falls back to ``max(2, revision_len // 10)`` (only consulted when
+      ``two_opt_kind == "decomp_sampling"``).
+    * ``opts.two_opt_decomp_sampling_candidate_r`` (int or ``None``, default
+      ``None``) — far-distance window size for the decomposition+sampling
+      composition. The actual destination set is
+      ``[base + shift, base + shift + r_candidate + 1)`` and its negation
+      (matching ``sampling_radius_2opt_gain_matrix``). When ``None`` the
+      dispatcher falls back to ``max(2, N // 10)`` (only consulted when
+      ``two_opt_kind == "decomp_sampling"``).
     * ``opts.two_opt_debug`` (bool, default ``False``) — print per-sweep phase
       timings to stdout for performance investigation.
     * ``opts.record_two_opt_swaps`` (bool, default ``False``) — when True,
@@ -1799,6 +2441,31 @@ def maybe_two_opt(seeds, opts, revision_len=None):
             record=record,
         )
 
+    if kind == "hop_radius":
+        # Hop-stride tour-position sparse variant: each sweep picks
+        # candidate offsets ``base, base+h, base+2h, ..., base+(k-1)*h``
+        # (and the symmetric negatives), where
+        # ``k = (N - base - 1) // 2 // h``. Regular stride, no shifting
+        # window — successive sweeps use the same offset set, so the
+        # benefit comes from sparse coverage of a broader offset range
+        # at per-call cost ``O(B * N * k)``. No swap-and-warn when
+        # ``base > h`` because ``h`` is a stride, not a width.
+        base = getattr(opts, "two_opt_hop_base", None)
+        h = getattr(opts, "two_opt_hop_h", None)
+        N = seeds.shape[1]
+        if base is None:
+            base = 2
+        if h is None:
+            h = max(2, N // 10)
+        return hop_radius_2opt(
+            seeds,
+            iters=iters,
+            base=int(base),
+            h=int(h),
+            debug=debug,
+            record=record,
+        )
+
     if kind == "decomp":
         # Seams are only well-defined in the reassembled tour frame
         # produced by LCP_TSP, so the decomposition-aware variant is
@@ -1836,6 +2503,55 @@ def maybe_two_opt(seeds, opts, revision_len=None):
             iters=iters,
             revision_len=int(rl),
             r=int(r) if r is not None else None,
+            debug=debug,
+            record=record,
+        )
+
+    if kind == "decomp_sampling":
+        # Seam-initiated × far-distance composition. Like ``decomp``, this
+        # variant needs a per-revisor-iter ``revision_len`` to know where
+        # the seams land, so it is restricted to ``per_iter`` mode. In
+        # ``final`` mode we emit a warning and skip rather than silently
+        # producing a meaningless search.
+        if getattr(opts, "two_opt_mode", "final") != "per_iter":
+            warnings.warn(
+                "two_opt_kind='decomp_sampling' requires "
+                "--two_opt_mode=per_iter (seams are only well-defined per "
+                "revisor iter); skipping.",
+                stacklevel=2,
+            )
+            return seeds
+        rl = revision_len
+        if rl is None:
+            # Library caller did not thread revision_len; fall back to the
+            # last layer's window length when available. Emit a warning so
+            # the silent fallback does not surprise users.
+            rl_list = getattr(opts, "revision_lens", None)
+            if rl_list:
+                rl = int(rl_list[-1])
+                warnings.warn(
+                    f"two_opt_kind='decomp_sampling': revision_len not "
+                    f"provided; using opts.revision_lens[-1]={rl} as a "
+                    f"heuristic.",
+                    stacklevel=2,
+                )
+        if rl is None:
+            warnings.warn(
+                "two_opt_kind='decomp_sampling': no revision_len "
+                "available; skipping.",
+                stacklevel=2,
+            )
+            return seeds
+        base = getattr(opts, "two_opt_decomp_sampling_base", None)
+        r_seam = getattr(opts, "two_opt_decomp_sampling_seam_radius", None)
+        r_cand = getattr(opts, "two_opt_decomp_sampling_candidate_r", None)
+        return decomp_sampling_2opt(
+            seeds,
+            iters=iters,
+            base=int(base) if base is not None else None,
+            revision_len=int(rl),
+            r_seam=int(r_seam) if r_seam is not None else None,
+            r_candidate=int(r_cand) if r_cand is not None else None,
             debug=debug,
             record=record,
         )

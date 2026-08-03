@@ -326,98 +326,54 @@ def make_modes(opts):
         # only consulted when two_opt_kind == "decomp_sampling".
         (
             "baseline",
-            False, "final", "full",
-            20, None, None, None, None, None, None,
-            None, None, None,
-        ),
-        (
-            "full_2opt",
-            True, "per_iter", "full",
-            20, None, None, None, None, None, None,
-            None, None, None,
-        ),
-        (
-            "knn_2opt",
-            True, "per_iter", "knn",
-            20, None, None, None, None, None, None,
-            None, None, None,
-        ),
-        (
-            "seam_2opt_k_2",
-            True, "per_iter", "decomp",
-            20, None, None, None, 2, None, None,
-            None, None, None,
-        ),
-        (
-            "seam_2opt_k_5",
-            True, "per_iter", "decomp",
-            20, None, None, None, 5, None, None,
-            None, None, None,
-        ),
-        (
-            "seam_2opt_k_10",
-            True, "per_iter", "decomp",
-            20, None, None, None, 10, None, None,
-            None, None, None,
-        ),
-        (
-            "seam_2opt_k_20",
-            True, "per_iter", "decomp",
-            20, None, None, None, 20, None, None,
-            None, None, None,
-        ),
-        (
-            "far_2opt",
-            True, "per_iter", "range_radius",
-            20, None, 50, 10000, None, None, None,
-            None, None, None,
-        ),
-        (
-            "far_2opt_m_100",
-            True, "per_iter", "sampling_radius",
-            20, None, None, None, None, 50, 100,
-            None, None, None,
-        ),
-        # hop_radius rows repurpose the unused-for-this-kind
-        # sampling_base / sampling_r slots to carry hop_base / hop_h;
-        # run_mode aliases them onto opts.two_opt_hop_base / _h before
-        # the dispatcher reads them.
-        (
-            "hop_per_iter_default",
-            True, "per_iter", "hop_radius",
-            20, None, None, None, None,
-            2,    # hop_base (sampling_base slot)
-            None, # hop_h -> dispatcher default max(2, N // 10)
-            None, None, None,
-        ),
-        (
-            "hop_per_iter_wide",
-            True, "per_iter", "hop_radius",
-            20, None, None, None, None,
-            50,   # hop_base
-            100,  # hop_h (explicit wide stride)
-            None, None, None,
+            False,
+            "final",
+            "full",
+            20,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         ),
         # decomp_sampling rows: seam-initiated × far-distance composition.
         # The 3 knobs (base, r_seam, r_candidate) live in the last 3
         # tuple slots; all 11 prior slots are unused for this kind.
         (
-            "seam_far_2opt_k_2",
-            True, "per_iter", "decomp_sampling",
-            20, None, None, None, None, None, None,
-            2, 2, 50,
+            "seam_far_2opt_m_100",
+            True,
+            "per_iter",
+            "decomp_sampling",
+            20,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            50,
+            20,
+            750,
         ),
         (
-            "seam_far_2opt_k_5",
-            True, "per_iter", "decomp_sampling",
-            20, None, None, None, None, None, None,
-            2, 5, 50,
-        ),
-        (
-            "seam_far_2opt_m_50",
-            True, "per_iter", "decomp_sampling",
-            20, None, None, None, None, None, None,
-            25, 2, 50,
+            "seam_far_2opt_m_500",
+            True,
+            "per_iter",
+            "decomp_sampling",
+            20,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            50,
+            20,
+            2000,
         ),
     ]
 
@@ -470,7 +426,16 @@ def build_base_opts():
         "--two_opt_kind",
         type=str,
         default="full",
-        choices=["full", "knn", "radius", "range_radius", "sampling_radius", "hop_radius", "decomp", "decomp_sampling"],
+        choices=[
+            "full",
+            "knn",
+            "radius",
+            "range_radius",
+            "sampling_radius",
+            "hop_radius",
+            "decomp",
+            "decomp_sampling",
+        ],
         help="2-opt algorithm variant: 'full' (dense), "
         "'knn' (k-NN-sparse; uses --two_opt_knn_k), "
         "'radius' (tour-position-sparse; uses --two_opt_radius), "
@@ -945,8 +910,10 @@ def plot_comparison(runs, opts):
             if (
                 opts.two_opt_kind == "decomp_sampling"
                 and getattr(opts, "two_opt_decomp_sampling_base", None) is not None
-                and getattr(opts, "two_opt_decomp_sampling_seam_radius", None) is not None
-                and getattr(opts, "two_opt_decomp_sampling_candidate_r", None) is not None
+                and getattr(opts, "two_opt_decomp_sampling_seam_radius", None)
+                is not None
+                and getattr(opts, "two_opt_decomp_sampling_candidate_r", None)
+                is not None
             )
             else ""
         )
@@ -1031,8 +998,10 @@ def plot_comparison(runs, opts):
             if (
                 opts.two_opt_kind == "decomp_sampling"
                 and getattr(opts, "two_opt_decomp_sampling_base", None) is not None
-                and getattr(opts, "two_opt_decomp_sampling_seam_radius", None) is not None
-                and getattr(opts, "two_opt_decomp_sampling_candidate_r", None) is not None
+                and getattr(opts, "two_opt_decomp_sampling_seam_radius", None)
+                is not None
+                and getattr(opts, "two_opt_decomp_sampling_candidate_r", None)
+                is not None
             )
             else ""
         )
@@ -1126,8 +1095,10 @@ def _build_tag(opts):
             if (
                 opts.two_opt_kind == "decomp_sampling"
                 and getattr(opts, "two_opt_decomp_sampling_base", None) is not None
-                and getattr(opts, "two_opt_decomp_sampling_seam_radius", None) is not None
-                and getattr(opts, "two_opt_decomp_sampling_candidate_r", None) is not None
+                and getattr(opts, "two_opt_decomp_sampling_seam_radius", None)
+                is not None
+                and getattr(opts, "two_opt_decomp_sampling_candidate_r", None)
+                is not None
             )
             else ""
         )
