@@ -1,8 +1,8 @@
 """Standalone SHPP (Shortest Hamiltonian Path Problem) evaluation.
 
-Compares the GLOP reviser-100 checkpoint against LKH-3 on a test set of
-SHPP instances of size 100, drawn from the same `unit` and `scale` point
-distributions the revisor was trained on.
+Compares a GLOP reviser checkpoint (any of the pretrained sizes 10/20/50/100)
+against LKH-3 on a test set of SHPP instances, drawn from the same `unit`
+and `scale` point distributions the revisor was trained on.
 
 Both solvers are given the same open-path problem:
   - the revisor is its native task (open path with anchored endpoints);
@@ -25,7 +25,6 @@ import os
 import subprocess
 import sys
 import time
-from collections import defaultdict
 
 import numpy as np
 import torch
@@ -38,23 +37,21 @@ if _HERE not in sys.path:
 
 from utils import load_model  # noqa: E402
 
-
 # --- Constants ------------------------------------------------------------
 
-LKH_BIN_REL = "LKH-3.0.14/LKH"            # pre-built binary, relative to GLOP root
-REVISER_PATH_REL = "pretrained/Reviser-stage2/reviser_100/epoch-299.pt"
-SHPP_SIZE = 100                           # locked by user choice
-DUMMY_ID = SHPP_SIZE + 1                  # 101 — internal depot
-TSPLIB_SCALE = 10_000_000                 # coords are multiplied by this
-                                          # before the rounded Euclidean
-                                          # distance is computed, matching
-                                          # `utils/lkh.py:write_tsplib`.
-HUGE = 1_000_000_000_000                  # sentinel: must dominate any
-                                          # real edge after TSPLIB_SCALE
-                                          # (max edge ~1.4e7).
+LKH_BIN_REL = "LKH-3.0.14/LKH"  # pre-built binary, relative to GLOP root
+REVISER_TEMPLATE = "pretrained/Reviser-stage2/reviser_{size}/epoch-299.pt"
+TSPLIB_SCALE = 10_000_000  # coords are multiplied by this
+# before the rounded Euclidean
+# distance is computed, matching
+# `utils/lkh.py:write_tsplib`.
+HUGE = 1_000_000_000_000  # sentinel: must dominate any
+# real edge after TSPLIB_SCALE
+# (max edge ~1.4e7).
 
 
 # --- Instance generation --------------------------------------------------
+
 
 def generate_instances(n_unit, n_scale, N, seed):
     """Sample SHPP point sets from `unit` and `scale` distributions.
@@ -91,6 +88,7 @@ def generate_instances(n_unit, n_scale, N, seed):
 
 # --- SHPP cost ------------------------------------------------------------
 
+
 def shpp_cost(coords, tour):
     """Open-path L2 cost matching `LOCAL.get_costs` (no closing edge).
 
@@ -105,6 +103,7 @@ def shpp_cost(coords, tour):
 
 
 # --- LKH-3 writer (TYPE: TSP + dummy depot + FIXED_EDGES_SECTION) ---------
+
 
 def _rounded_euclidean(p, q):
     """LKH-3 EUC_2D's `round(sqrt(dx^2 + dy^2))`."""
@@ -124,6 +123,7 @@ def write_shpp_lkh_files(directory, instance_id, coords):
     equals the SHPP cost exactly.
     """
     N = coords.shape[0]
+    dummy_id = N + 1  # 1-indexed depot id
     name = f"shpp_{instance_id}"
     base = os.path.join(directory, f"{name}.hpp1")
     vrp_path = base + ".vrp"
@@ -149,9 +149,9 @@ def write_shpp_lkh_files(directory, instance_id, coords):
     # Row/column for the depot: only the two forced neighbours are cheap.
     for k in range(N):
         is_forced_neighbour = (k == 0) or (k == N - 1)
-        D[N, k] = 0 if is_forced_neighbour else HUGE   # depot -> real
-        D[k, N] = 0 if is_forced_neighbour else HUGE   # real -> depot
-    D[N, N] = 0                                         # depot self-loop
+        D[N, k] = 0 if is_forced_neighbour else HUGE  # depot -> real
+        D[k, N] = 0 if is_forced_neighbour else HUGE  # real -> depot
+    D[N, N] = 0  # depot self-loop
 
     # --- .vrp ------------------------------------------------------------
     with open(vrp_path, "w") as f:
@@ -168,8 +168,8 @@ def write_shpp_lkh_files(directory, instance_id, coords):
         # Force the depot into the closing position of the tour so that
         # the resulting closed tour, minus the depot, is the SHPP path.
         f.write("FIXED_EDGES_SECTION\n")
-        f.write(f"{DUMMY_ID} 1\n")    # depot -> start (1-indexed)
-        f.write(f"{N} {DUMMY_ID}\n")  # end -> depot
+        f.write(f"{dummy_id} 1\n")  # depot -> start (1-indexed)
+        f.write(f"{N} {dummy_id}\n")  # end -> depot
         f.write("-1\n")
         f.write("EOF\n")
 
@@ -194,22 +194,20 @@ def _lkh_worker(args):
     node sequence (length N) excluding the dummy depot.
     """
     instance_id, dist_label, coords, working_dir, lkh_bin = args
+    N = coords.shape[0]
+    dummy_id = N + 1
     os.makedirs(working_dir, exist_ok=True)
-    vrp_path, par_path, tour_path, log_path = write_shpp_lkh_files(
+    _vrp_path, par_path, tour_path, log_path = write_shpp_lkh_files(
         working_dir, instance_id, coords
     )
 
     t0 = time.time()
     try:
         with open(log_path, "w") as flog:
-            subprocess.check_call(
-                [lkh_bin, par_path], stdout=flog, stderr=flog
-            )
+            subprocess.check_call([lkh_bin, par_path], stdout=flog, stderr=flog)
         runtime = time.time() - t0
     except Exception as exc:  # noqa: BLE001
-        sys.stderr.write(
-            f"[lkh_worker] instance {instance_id} LKH-3 failed: {exc}\n"
-        )
+        sys.stderr.write(f"[lkh_worker] instance {instance_id} LKH-3 failed: {exc}\n")
         return instance_id, dist_label, float("nan"), 0.0, None
 
     # Read the closed tour (length N+1, 1-indexed).
@@ -227,16 +225,16 @@ def _lkh_worker(args):
                 if line:
                     tour_1idx.append(int(line))
 
-    if len(tour_1idx) != SHPP_SIZE + 1:
+    if len(tour_1idx) != N + 1:
         sys.stderr.write(
             f"[lkh_worker] instance {instance_id}: tour length "
-            f"{len(tour_1idx)} != {SHPP_SIZE + 1}\n"
+            f"{len(tour_1idx)} != {N + 1}\n"
         )
         return instance_id, dist_label, float("nan"), runtime, None
 
     # Strip the depot, leaving the SHPP path 1-indexed, then 0-indexed.
-    path_1idx = [t for t in tour_1idx if t != DUMMY_ID]
-    if len(path_1idx) != SHPP_SIZE or set(path_1idx) != set(range(1, SHPP_SIZE + 1)):
+    path_1idx = [t for t in tour_1idx if t != dummy_id]
+    if len(path_1idx) != N or set(path_1idx) != set(range(1, N + 1)):
         sys.stderr.write(
             f"[lkh_worker] instance {instance_id}: depot-stripped path "
             f"is malformed\n"
@@ -251,8 +249,7 @@ def _lkh_worker(args):
 def run_lkh_parallel(coords, dist_labels, lkh_bin, work_dir, cpus):
     """Run LKH-3 over all instances in parallel via a process pool."""
     tasks = [
-        (i, dist_labels[i], coords[i],
-         os.path.join(work_dir, f"inst_{i:06d}"), lkh_bin)
+        (i, dist_labels[i], coords[i], os.path.join(work_dir, f"inst_{i:06d}"), lkh_bin)
         for i in range(coords.shape[0])
     ]
     results = [None] * coords.shape[0]
@@ -269,6 +266,7 @@ def run_lkh_parallel(coords, dist_labels, lkh_bin, work_dir, cpus):
 
 # --- Reviser inference ----------------------------------------------------
 
+
 def run_revisor_inference(model, coords, device, batch_size, decode_strategy="greedy"):
     """Run the reviser over `coords`, returning per-instance cost/path/time.
 
@@ -277,7 +275,6 @@ def run_revisor_inference(model, coords, device, batch_size, decode_strategy="gr
     directly.
     """
     model.set_decode_type(decode_strategy)
-    N = coords.shape[1]
     all_costs = np.empty(coords.shape[0], dtype=np.float64)
     all_paths = [None] * coords.shape[0]
 
@@ -292,14 +289,14 @@ def run_revisor_inference(model, coords, device, batch_size, decode_strategy="gr
             # forward(..., return_pi=True) returns (cost, pi, cost2, pi2_flipped).
             cost, pi, cost2, _pi2 = model(batch, return_pi=True)
             # Use the cheaper of the two decode directions.
-            cost_b = torch.stack([cost, cost2], dim=1)             # (B, 2)
-            best_idx = cost_b.argmin(dim=1)                        # (B,)
+            cost_b = torch.stack([cost, cost2], dim=1)  # (B, 2)
+            best_idx = cost_b.argmin(dim=1)  # (B,)
             best_cost = cost_b.gather(1, best_idx.unsqueeze(1)).squeeze(1)
             pi_best = torch.where(
                 best_idx.unsqueeze(1).eq(0),
                 pi,
                 _pi2,
-            )                                                     # (B, N)
+            )  # (B, N)
             for j in range(end - start):
                 all_costs[start + j] = float(best_cost[j].item())
                 all_paths[start + j] = pi_best[j].cpu().tolist()
@@ -310,39 +307,81 @@ def run_revisor_inference(model, coords, device, batch_size, decode_strategy="gr
 
 # --- CLI ------------------------------------------------------------------
 
+
 def build_opts():
     p = argparse.ArgumentParser(
-        description="Compare reviser-100 against LKH-3 on SHPP instances."
+        description="Compare GLOP revisers against LKH-3 on SHPP instances."
     )
-    p.add_argument("--val_size", type=int, default=10000,
-                   help="Total SHPP instances (split evenly across unit/scale).")
-    p.add_argument("--n_unit", type=int, default=-1,
-                   help="Override count of unit-distribution instances.")
-    p.add_argument("--n_scale", type=int, default=-1,
-                   help="Override count of scale-distribution instances.")
+    p.add_argument(
+        "--shpp_sizes",
+        type=int,
+        nargs="+",
+        default=[20, 50, 100],
+        help="SHPP sizes to evaluate (one reviser checkpoint per size).",
+    )
+    p.add_argument(
+        "--val_size",
+        type=int,
+        default=10000,
+        help="Total SHPP instances per size (split evenly across unit/scale).",
+    )
+    p.add_argument(
+        "--n_unit",
+        type=int,
+        default=-1,
+        help="Override count of unit-distribution instances.",
+    )
+    p.add_argument(
+        "--n_scale",
+        type=int,
+        default=-1,
+        help="Override count of scale-distribution instances.",
+    )
     p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--eval_batch_size", type=int, default=256,
-                   help="Revisor GPU batch size.")
-    p.add_argument("--cpus", type=int, default=max(1, os.cpu_count() or 1),
-                   help="Worker processes for parallel LKH-3 calls.")
-    p.add_argument("--decode_strategy", choices=["greedy", "sampling"],
-                   default="greedy")
+    p.add_argument(
+        "--eval_batch_size", type=int, default=256, help="Revisor GPU batch size."
+    )
+    p.add_argument(
+        "--cpus",
+        type=int,
+        default=max(1, os.cpu_count() or 1),
+        help="Worker processes for parallel LKH-3 calls.",
+    )
+    p.add_argument(
+        "--decode_strategy", choices=["greedy", "sampling"], default="greedy"
+    )
     p.add_argument("--no_cuda", action="store_true")
     p.add_argument("--device_id", type=int, default=0)
-    p.add_argument("--lkh_bin", default=LKH_BIN_REL,
-                   help="Path to the LKH-3 executable.")
+    p.add_argument(
+        "--reviser_path",
+        default=None,
+        help="Override the reviser checkpoint path; defaults to "
+        "pretrained/Reviser-stage2/reviser_{size}/epoch-299.pt "
+        "for each --shpp_size.",
+    )
+    p.add_argument(
+        "--lkh_bin", default=LKH_BIN_REL, help="Path to the LKH-3 executable."
+    )
     p.add_argument("--out_dir", default="results/shpp_eval")
-    p.add_argument("--work_dir", default="results/shpp_lkh",
-                   help="Per-instance LKH-3 working directories.")
+    p.add_argument(
+        "--work_dir",
+        default="results/shpp_lkh",
+        help="Per-instance LKH-3 working directories.",
+    )
     p.add_argument("--no_progress_bar", action="store_true")
-    p.add_argument("--disable_lkh", action="store_true",
-                   help="Skip LKH-3 (revisor-only dry run).")
-    p.add_argument("--disable_revisor", action="store_true",
-                   help="Skip revisor (LKH-3-only dry run).")
+    p.add_argument(
+        "--disable_lkh", action="store_true", help="Skip LKH-3 (revisor-only dry run)."
+    )
+    p.add_argument(
+        "--disable_revisor",
+        action="store_true",
+        help="Skip revisor (LKH-3-only dry run).",
+    )
     return p.parse_args()
 
 
 # --- Aggregation ----------------------------------------------------------
+
 
 def _ci(x):
     x = np.asarray(x, dtype=np.float64)
@@ -373,45 +412,54 @@ def _summarize(rev_costs, lkh_costs, rev_total, lkh_total):
     }
 
 
-# --- Main -----------------------------------------------------------------
+# --- Per-size evaluation -------------------------------------------------
 
-def main():
-    opts = build_opts()
-    for k, v in vars(opts).items():
-        print(f"  {k} = {v}")
 
-    # Resolve relative paths against the project root (script directory).
-    proj_root = _HERE
-    lkh_bin = opts.lkh_bin
-    if not os.path.isabs(lkh_bin):
-        lkh_bin = os.path.join(proj_root, lkh_bin)
-    reviser_path = REVISER_PATH_REL
-    if not os.path.isabs(reviser_path):
-        reviser_path = os.path.join(proj_root, reviser_path)
+def _resolve_reviser_path(opts, shpp_size, proj_root):
+    """Return the absolute path to the reviser checkpoint for this size."""
+    if opts.reviser_path is not None:
+        path = opts.reviser_path
+    else:
+        path = REVISER_TEMPLATE.format(size=shpp_size)
+    if not os.path.isabs(path):
+        path = os.path.join(proj_root, path)
+    return path
 
-    if not os.path.isfile(lkh_bin) or not os.access(lkh_bin, os.X_OK):
-        sys.stderr.write(f"ERROR: LKH-3 binary not found or not executable: {lkh_bin}\n")
-        sys.exit(1)
+
+def run_size(opts, shpp_size, lkh_bin, proj_root, out_dir, work_root):
+    """Run the full revisor-vs-LKH-3 pipeline for a single SHPP size.
+
+    Writes a per-instance JSONL and a summary JSON under `out_dir`, using
+    the size in the filename so multiple sizes don't collide.  LKH-3
+    working directories land under `<work_root>/shpp_<size>/inst_*/`.
+    """
+    reviser_path = _resolve_reviser_path(opts, shpp_size, proj_root)
     if not opts.disable_revisor and not os.path.isfile(reviser_path):
-        sys.stderr.write(f"ERROR: reviser checkpoint not found: {reviser_path}\n")
+        sys.stderr.write(
+            f"ERROR: reviser checkpoint not found for size {shpp_size}: "
+            f"{reviser_path}\n"
+        )
         sys.exit(1)
-
-    out_dir = opts.out_dir if os.path.isabs(opts.out_dir) else os.path.join(proj_root, opts.out_dir)
-    work_dir = opts.work_dir if os.path.isabs(opts.work_dir) else os.path.join(proj_root, opts.work_dir)
-    os.makedirs(out_dir, exist_ok=True)
-    os.makedirs(work_dir, exist_ok=True)
 
     # Resolve n_unit / n_scale.
     n_unit = opts.n_unit if opts.n_unit >= 0 else opts.val_size // 2
     n_scale = opts.n_scale if opts.n_scale >= 0 else opts.val_size - n_unit
-    assert n_unit + n_scale == opts.val_size, (
-        f"n_unit ({n_unit}) + n_scale ({n_scale}) != val_size ({opts.val_size})"
-    )
+    assert (
+        n_unit + n_scale == opts.val_size
+    ), f"n_unit ({n_unit}) + n_scale ({n_scale}) != val_size ({opts.val_size})"
 
-    coords, dist_labels = generate_instances(n_unit, n_scale, SHPP_SIZE, opts.seed)
+    coords, dist_labels = generate_instances(n_unit, n_scale, shpp_size, opts.seed)
     M = coords.shape[0]
-    print(f"Generated {M} SHPP instances of size {SHPP_SIZE} "
-          f"({n_unit} unit, {n_scale} scale).")
+    print(f"\n--- SHPP-{shpp_size} ---")
+    print(
+        f"Generated {M} SHPP instances of size {shpp_size} "
+        f"({n_unit} unit, {n_scale} scale)."
+    )
+    if not opts.disable_revisor:
+        print(f"Reviser checkpoint: {os.path.relpath(reviser_path, proj_root)}")
+
+    size_work_dir = os.path.join(work_root, f"shpp_{shpp_size}")
+    os.makedirs(size_work_dir, exist_ok=True)
 
     # --- Phase A: revisor -----------------------------------------------
     rev_costs = np.full(M, np.nan, dtype=np.float64)
@@ -419,7 +467,8 @@ def main():
     rev_total = 0.0
     if not opts.disable_revisor:
         device = torch.device(
-            f"cuda:{opts.device_id}" if (torch.cuda.is_available() and not opts.no_cuda)
+            f"cuda:{opts.device_id}"
+            if (torch.cuda.is_available() and not opts.no_cuda)
             else "cpu"
         )
         model, _ = load_model(reviser_path, is_local=True)
@@ -436,7 +485,7 @@ def main():
     lkh_total = 0.0
     if not opts.disable_lkh:
         lkh_results = run_lkh_parallel(
-            coords, dist_labels, lkh_bin, work_dir, opts.cpus
+            coords, dist_labels, lkh_bin, size_work_dir, opts.cpus
         )
         for i, (dist, cost, rt, path) in enumerate(lkh_results):
             lkh_costs[i] = cost
@@ -445,7 +494,10 @@ def main():
         lkh_total = float(lkh_runtimes.sum())
 
     # --- Per-instance records ------------------------------------------
-    tag = f"n{M}_b{opts.eval_batch_size}_dec-{opts.decode_strategy}_seed{opts.seed}"
+    tag = (
+        f"shpp{shpp_size}_n{M}_b{opts.eval_batch_size}_"
+        f"dec-{opts.decode_strategy}_seed{opts.seed}"
+    )
     jsonl_path = os.path.join(out_dir, f"shpp_{tag}.jsonl")
     summary_path = os.path.join(out_dir, f"shpp_{tag}.summary.json")
 
@@ -461,9 +513,14 @@ def main():
             "revisor_path": rev_paths[i],
             "lkh_path": lkh_paths[i],
         }
-        if (rec["revisor_cost"] is not None and rec["lkh_cost"] is not None
-                and rec["lkh_cost"] > 0):
-            rec["gap_pct"] = 100.0 * (rec["revisor_cost"] - rec["lkh_cost"]) / rec["lkh_cost"]
+        if (
+            rec["revisor_cost"] is not None
+            and rec["lkh_cost"] is not None
+            and rec["lkh_cost"] > 0
+        ):
+            rec["gap_pct"] = (
+                100.0 * (rec["revisor_cost"] - rec["lkh_cost"]) / rec["lkh_cost"]
+            )
         else:
             rec["gap_pct"] = None
         records.append(rec)
@@ -487,7 +544,7 @@ def main():
 
     summary = {
         "config": {
-            "shpp_size": SHPP_SIZE,
+            "shpp_size": shpp_size,
             "n": M,
             "n_unit": n_unit,
             "n_scale": n_scale,
@@ -508,7 +565,7 @@ def main():
     # --- Pretty table ---------------------------------------------------
     print()
     print("=" * 72)
-    print(f"SHPP-{SHPP_SIZE}  |  n={M}  |  revisor vs. LKH-3")
+    print(f"SHPP-{shpp_size}  |  n={M}  |  revisor vs. LKH-3")
     print("=" * 72)
     hdr = (
         f"{'split':<10}  {'revisor':>14}  {'LKH-3':>14}  "
@@ -535,6 +592,73 @@ def main():
         if dist in by_dist:
             _row(dist, by_dist[dist])
     print("=" * 72)
+
+    return summary
+
+
+# --- Main -----------------------------------------------------------------
+
+
+def main():
+    opts = build_opts()
+    for k, v in vars(opts).items():
+        print(f"  {k} = {v}")
+
+    # Resolve relative paths against the project root (script directory).
+    proj_root = _HERE
+    lkh_bin = opts.lkh_bin
+    if not os.path.isabs(lkh_bin):
+        lkh_bin = os.path.join(proj_root, lkh_bin)
+
+    if not os.path.isfile(lkh_bin) or not os.access(lkh_bin, os.X_OK):
+        sys.stderr.write(
+            f"ERROR: LKH-3 binary not found or not executable: {lkh_bin}\n"
+        )
+        sys.exit(1)
+
+    out_dir = (
+        opts.out_dir
+        if os.path.isabs(opts.out_dir)
+        else os.path.join(proj_root, opts.out_dir)
+    )
+    work_root = (
+        opts.work_dir
+        if os.path.isabs(opts.work_dir)
+        else os.path.join(proj_root, opts.work_dir)
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(work_root, exist_ok=True)
+
+    summaries = {}
+    for size in opts.shpp_sizes:
+        summaries[size] = run_size(opts, size, lkh_bin, proj_root, out_dir, work_root)
+
+    if len(opts.shpp_sizes) > 1:
+        # Cross-size summary table.
+        print()
+        print("=" * 88)
+        print(f"Cross-size summary  (n={opts.val_size} per size)")
+        print("=" * 88)
+        hdr = (
+            f"{'size':>6}  {'revisor':>14}  {'LKH-3':>14}  "
+            f"{'gap %':>10}  {'win%':>8}  {'LKH sec':>10}"
+        )
+        print(hdr)
+        print("-" * len(hdr))
+        for size, summary in summaries.items():
+            s = summary["overall"]
+            if s["n_valid"] == 0:
+                print(f"{size:>6}  (no data)")
+                continue
+            print(
+                f"{size:>6}  "
+                f"{s['revisor_mean']:>10.4f} ±{s['revisor_ci95']:<4.4f}  "
+                f"{s['lkh_mean']:>10.4f} ±{s['lkh_ci95']:<4.4f}  "
+                f"{s['gap_mean_pct']:>+10.3f}  "
+                f"{s['win_rate_pct']:>8.2f}  "
+                f"{s['lkh_total_sec']:>10.2f}"
+            )
+        print("=" * 88)
 
 
 if __name__ == "__main__":
