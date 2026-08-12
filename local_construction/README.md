@@ -38,3 +38,21 @@ python local_construction/generate_data_RG.py --load_path pretrained/Reviser-sta
 # To fine-tune Reviser-50:
 python local_construction/run.py --data_distribution scale --RI_train --graph_size 50 --lr_decay 0.99 --RI_path data/RG_train_tsp/RG50.pt --load_path pretrained/Reviser-stage1/reviser_50/epoch-199.pt --n_epochs 300
 ```
+
+### Integration of data augmentation, adverisal training and new loss functions
+
+Clustered / perturbed dataset can be generated via
+
+```bash
+python local_construction/generate_data_RI_w_rbf_soft.py # Liming's
+```
+
+Curriculum training on 2 different datasets (the 2 baselines are kept seperately)
+
+```bash
+python local_construction/run_curriculum.py \
+  --RI_train  --RI_path  data/RI_train_tsp/500_RI100_seed1235.pt \
+  --RI_train2 --RI_path2 data/RI_w_rbf_soft_train_tsp/500_RI_w_rbf_soft100_seed1235.pt \
+  --n_epochs1 5 --n_epochs2 5 --n_epochs 300 \
+  --output_dir outputs/curriculum --run_name ri_then_rbf # Liming's
+```

@@ -71,6 +71,10 @@ def get_options(args=None):
     parser.add_argument('--no_progress_bar', action='store_true', help='Disable progress bar')
     parser.add_argument('--RI_train', action='store_true', help='Train with the samples generated with farthest insertion')
     parser.add_argument('--RI_path', help='Train with the samples generated with farthest insertion')
+    parser.add_argument('--RI_train2', action='store_true', help='Enable a second training dataset for alternating curriculum training')
+    parser.add_argument('--RI_path2', default=None, help='Path to the second training dataset tensor (used when --RI_train2 is set)')
+    parser.add_argument('--n_epochs1', type=int, default=1, help='Number of epochs on dataset 1 per block in the alternating curriculum (default 1)')
+    parser.add_argument('--n_epochs2', type=int, default=1, help='Number of epochs on dataset 2 per block in the alternating curriculum (default 1)')
 
     opts = parser.parse_args(args)
 
