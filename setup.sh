@@ -12,10 +12,10 @@ PYG_INDEX="https://data.pyg.org/whl/torch-1.13.0+cu117.html"
 pip install --index-url "$PYTORCH_INDEX" torch==1.13.0+cu117
 
 # PyG companion wheels must match torch + CUDA version.
-pip install --extra-index-url "$PYG_INDEX" \
+pip install \
     pyg-lib==0.4.0+pt113cu117 \
     torch-scatter==2.1.1+pt113cu117 \
-    torch-sparse==0.6.17+pt113cu117
+    torch-sparse==0.6.17+pt113cu117 -f "$PYG_INDEX"
 
 # Everything else (torch_geometric, scipy, random-insertion, tensorboard-logger, …).
 pip install -r requirements.txt
