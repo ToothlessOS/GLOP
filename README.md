@@ -45,55 +45,84 @@ Refer to Pytorch documentation for cuda support
 `pyg-lib`, `torch-scatter` and `torch-sparse` need to be installed from: https://data.pyg.org/whl/torch-1.13.0%2Bcu117.html
 
 ```
-aiohappyeyeballs==2.6.2
-aiohttp==3.14.1
-aiosignal==1.4.0
-async-timeout==5.0.1
-attrs==26.1.0
-certifi==2026.6.17
-charset-normalizer==3.4.7
-contourpy==1.3.2
-cycler==0.12.1
-exceptiongroup==1.3.1
-fonttools==4.63.0
-frozenlist==1.8.0
-fsspec==2026.6.0
-idna==3.18
-iniconfig==2.3.0
-Jinja2==3.1.6
-joblib==1.5.3
-kiwisolver==1.5.0
-MarkupSafe==3.0.3
-matplotlib==3.10.9
-multidict==6.7.1
-numpy==1.23.5
-packaging==26.0
-pillow==12.3.0
-pluggy==1.6.0
-propcache==0.5.2
-psutil==7.2.2
-pyg-lib==0.4.0+pt113cu117
-Pygments==2.20.0
-pyparsing==3.3.2
-pytest==9.1.1
-python-dateutil==2.9.0.post0
-random-insertion==0.3.0.post1
-requests==2.34.2
-ruff==0.15.20
-scikit-learn==1.7.2
-scipy==1.15.3
-six==1.17.0
-threadpoolctl==3.6.0
-tomli==2.4.1
-torch==1.13.0+cu117
-torch-scatter==2.1.1+pt113cu117
-torch-sparse==0.6.17+pt113cu117
-torch_geometric==2.5.0
-tqdm==4.68.3
-typing_extensions==4.15.0
-urllib3==2.7.0
-xxhash==3.8.0
-yarl==1.24.2
+aiohappyeyeballs   2.6.2
+aiohttp            3.14.1
+aiosignal          1.4.0
+asttokens          3.0.2
+async-timeout      5.0.1
+attrs              26.1.0
+certifi            2026.6.17
+charset-normalizer 3.4.7
+comm               0.2.3
+contourpy          1.3.2
+cycler             0.12.1
+debugpy            1.8.21
+decorator          5.3.1
+exceptiongroup     1.3.1
+executing          2.2.1
+fonttools          4.63.0
+frozenlist         1.8.0
+fsspec             2026.6.0
+idna               3.18
+iniconfig          2.3.0
+ipykernel          7.3.0
+ipython            8.37.0
+jedi               0.20.0
+Jinja2             3.1.6
+joblib             1.5.3
+jupyter_client     8.9.1
+jupyter_core       5.9.1
+kiwisolver         1.5.0
+MarkupSafe         3.0.3
+matplotlib         3.10.9
+matplotlib-inline  0.2.2
+multidict          6.7.1
+nest-asyncio2      1.7.2
+numpy              1.23.5
+packaging          26.0
+parso              0.8.7
+pexpect            4.9.0
+pickleshare        0.7.5
+pillow             12.3.0
+pip                26.1.2
+platformdirs       4.11.0
+pluggy             1.6.0
+prompt_toolkit     3.0.52
+propcache          0.5.2
+protobuf           3.20.3
+psutil             7.2.2
+ptyprocess         0.7.0
+pure_eval          0.2.3
+pyg-lib            0.4.0+pt113cu117
+Pygments           2.20.0
+pyparsing          3.3.2
+pytest             9.1.1
+python-dateutil    2.9.0.post0
+pyzmq              27.1.0
+random-insertion   0.3.0.post1
+requests           2.34.2
+ruff               0.15.20
+scikit-learn       1.7.2
+scipy              1.15.3
+setuptools         69.5.1
+six                1.17.0
+stack_data         0.6.3
+tensorboard-logger 0.1.0
+threadpoolctl      3.6.0
+tomli              2.4.1
+torch              1.13.0+cu117
+torch_geometric    2.5.0
+torch-scatter      2.1.1+pt113cu117
+torch-sparse       0.6.17+pt113cu117
+tornado            6.5.7
+tqdm               4.68.3
+traitlets          5.15.1
+typing_extensions  4.15.0
+urllib3            2.7.0
+wcwidth            0.8.2
+wheel              0.47.0
+xxhash             3.8.0
+yarl               1.24.2
 ```
 
 ---
