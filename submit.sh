@@ -22,7 +22,7 @@
 
 cd /dkucc/home/sc927/GLOP
 module load anaconda
-source activate glop
+source activate GLOP
 
 #------------------------
 # Run code
