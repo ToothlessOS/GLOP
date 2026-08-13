@@ -53,6 +53,7 @@ Curriculum training on 2 different datasets (the 2 baselines are kept seperately
 python local_construction/run_curriculum.py \
   --RI_train  --RI_path  data/RI_train_tsp/500_RI100_seed1235.pt \
   --RI_train2 --RI_path2 data/RI_w_rbf_soft_train_tsp/500_RI_w_rbf_soft100_seed1235.pt \
-  --n_epochs1 5 --n_epochs2 5 --n_epochs 300 \
-  --output_dir outputs/curriculum --run_name ri_then_rbf # Liming's
+  --n_epochs1 1 --n_epochs2 1 --n_epochs 10 \
+  --output_dir outputs/curriculum --run_name ri_then_rbf  \
+  --load_path pretrained/Reviser-stage1/reviser_100/epoch-199.pt
 ```

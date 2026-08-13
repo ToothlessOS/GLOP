@@ -1,5 +1,4 @@
-python eval_2opt_seam_far.py --problem_size 500 --revision_lens 100 50 20 --revision_iters 20 25 5     --width 10 --eval_batch_size 8 --val_size 128 --decode_strategy greedy     --two_opt_iters 100 --two_opt_
-knn_k 20 --record_two_opt_swaps
+python eval_2opt_seam_far.py --problem_size 500 --revision_lens 100 50 20 --revision_iters 20 25 5     --width 10 --eval_batch_size 8 --val_size 128 --decode_strategy greedy     --two_opt_iters 100 --two_opt_knn_k 20 --record_two_opt_swaps
 
 python eval_shpp.py --val_size 10000 --eval_batch_size 256 --cpus $(nproc) \
     --out_dir results/shpp_full --work_dir results/shpp_full_lkh
