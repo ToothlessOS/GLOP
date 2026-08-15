@@ -57,3 +57,22 @@ python local_construction/run_curriculum.py \
   --output_dir outputs/curriculum --run_name ri_then_rbf  \
   --load_path pretrained/Reviser-stage1/reviser_100/epoch-199.pt
 ```
+
+### Custom per-epoch curriculum sequences
+
+For full control over the dataset schedule, pass `--curriculum_seq` as a string
+of digits, one per epoch. `1` selects dataset 1 (`--RI_path`), `2` selects
+dataset 2 (`--RI_path2`). Length must equal `--n_epochs`. When set, this flag
+overrides the `--n_epochs1`/`--n_epochs2` block behavior.
+
+```bash
+python local_construction/run_curriculum.py \
+  --RI_train  --RI_path  data/RI_train_tsp/500_RI100_seed1235.pt \
+  --RI_train2 --RI_path2 data/RI_w_rbf_soft_train_tsp/500_RI_w_rbf_soft100_seed1235.pt \
+  --curriculum_seq 1121121121 --n_epochs 10 \
+  --output_dir outputs/curriculum --run_name seq_demo \
+  --load_path pretrained/Reviser-stage1/reviser_100/epoch-199.pt
+```
+
+For an interleaving like `UUCUUUUCUU` (dataset 1, dataset 1, dataset 2, ...),
+use `--curriculum_seq 1121121121` (7×`1` + 3×`2`).

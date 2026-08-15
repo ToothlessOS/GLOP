@@ -75,6 +75,12 @@ def get_options(args=None):
     parser.add_argument('--RI_path2', default=None, help='Path to the second training dataset tensor (used when --RI_train2 is set)')
     parser.add_argument('--n_epochs1', type=int, default=1, help='Number of epochs on dataset 1 per block in the alternating curriculum (default 1)')
     parser.add_argument('--n_epochs2', type=int, default=1, help='Number of epochs on dataset 2 per block in the alternating curriculum (default 1)')
+    parser.add_argument('--curriculum_seq', default=None,
+                        help=("Optional per-epoch dataset schedule as a string of digits, one per "
+                              "epoch. '1' = dataset 1 (--RI_path), '2' = dataset 2 (--RI_path2). "
+                              "Length must equal --n_epochs. When set, overrides "
+                              "--n_epochs1/--n_epochs2 block behavior. Example: '1121121121' for "
+                              "UUCUUUUCUU-style interleaving."))
 
     opts = parser.parse_args(args)
 

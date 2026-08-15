@@ -2,3 +2,16 @@ python eval_2opt_seam_far.py --problem_size 500 --revision_lens 100 50 20 --revi
 
 python eval_shpp.py --val_size 10000 --eval_batch_size 256 --cpus $(nproc) \
     --out_dir results/shpp_full --work_dir results/shpp_full_lkh
+
+python eval_2opt_seam_far_tsp1000.py \
+--tsp1000_distribution all --val_size 200 --eval_batch_size 25 \
+--revision_lens 100 50 20 --revision_iters 20 25 5 \
+--width 10 --two_opt_iters 100 --reviser_root pretrained/Reviser-stage2
+
+python local_construction/run_curriculum.py \
+  --RI_train  --RI_path  data/RG_train_tsp_og/RG50.pt \
+  --RI_train2 --RI_path2 data/RG_train_tsp_w_rbf_soft/RG50.pt \
+  --curriculum_seq 1121111211 --n_epochs 10 \
+  --output_dir outputs/curriculum --run_name seq_smoke \
+  --load_path pretrained/Reviser-stage2/reviser_100/epoch-299.pt \
+  --graph_size 50 --lr_decay 0.99

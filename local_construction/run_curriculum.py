@@ -209,6 +209,53 @@ def run(opts):
                 "in the alternating curriculum loop)."
             )
 
+        # Optional --curriculum_seq: parse the per-epoch schedule and validate
+        # that every requested dataset has actually been loaded. When the flag is
+        # None, the original --n_epochs1/--n_epochs2 alternating block loop below
+        # runs unchanged.
+        def _parse_curriculum_sequence(seq_str, n_epochs):
+            """Parse --curriculum_seq into a list of 0/1 ints (0=dataset1, 1=dataset2).
+            Returns None when seq_str is None. Raises RuntimeError on bad input."""
+            if seq_str is None:
+                return None
+            s = seq_str.strip()
+            if len(s) != n_epochs:
+                raise RuntimeError(
+                    "--curriculum_seq has length {} but --n_epochs is {}; they must "
+                    "match.".format(len(s), n_epochs)
+                )
+            out = []
+            for i, ch in enumerate(s):
+                if ch == "1":
+                    out.append(0)
+                elif ch == "2":
+                    out.append(1)
+                else:
+                    raise RuntimeError(
+                        "Invalid token '{}' in --curriculum_seq at position {}; "
+                        "allowed tokens are '1' (dataset 1) and '2' (dataset 2)."
+                        .format(ch, i)
+                    )
+            return out
+
+        curriculum = _parse_curriculum_sequence(opts.curriculum_seq, opts.n_epochs)
+        if curriculum is not None:
+            if (0 in curriculum) and train_dataset is None:
+                raise RuntimeError(
+                    "Sequence requests dataset 1 ('1') but --RI_train was not set; "
+                    "pass --RI_train and --RI_path."
+                )
+            if (1 in curriculum) and train_dataset2 is None:
+                raise RuntimeError(
+                    "Sequence requests dataset 2 ('2') but --RI_train2 was not set; "
+                    "pass --RI_train2 and --RI_path2."
+                )
+            if opts.n_epochs1 != 1 or opts.n_epochs2 != 1:
+                print(">> Note: --curriculum_seq overrides --n_epochs1/--n_epochs2.")
+            print(">> Curriculum sequence (length {}): {}".format(
+                len(curriculum), opts.curriculum_seq
+            ))
+
         # Alternating curriculum: spend opts.n_epochs1 epochs on dataset 1, then
         # opts.n_epochs2 epochs on dataset 2, repeating until opts.n_epochs total
         # epochs have been consumed. Each dataset uses its own baseline so the
@@ -218,53 +265,86 @@ def run(opts):
         total_epochs_remaining = lambda cur: epoch_end - cur  # noqa: E731
 
         while epoch < epoch_end:
-            # Block 1: dataset 1
-            if train_dataset is not None:
-                block = min(opts.n_epochs1, total_epochs_remaining(epoch))
-                if block > 0:
-                    print(
-                        ">> Block on dataset 1: {} epoch(s) starting at epoch {}".format(
-                            block, epoch
-                        )
+            if curriculum is not None:
+                # Sequence mode: each epoch selects dataset/baseline from the
+                # pre-parsed schedule. Slicing by opts.epoch_start keeps resume
+                # (lines 163-177) working — only the not-yet-run tail executes.
+                seq_window = curriculum[opts.epoch_start:epoch_end]
+                datasets_for_epoch = [
+                    train_dataset if idx == 0 else train_dataset2
+                    for idx in seq_window
+                ]
+                baselines_for_epoch = [
+                    baseline1 if idx == 0 else baseline2
+                    for idx in seq_window
+                ]
+                for slot, (ds, bl) in enumerate(
+                    zip(datasets_for_epoch, baselines_for_epoch)
+                ):
+                    e = opts.epoch_start + slot
+                    tag = "1 (U)" if ds is train_dataset else "2 (C)"
+                    print(">> Epoch {} on dataset {}".format(e, tag))
+                    train_epoch(
+                        model,
+                        optimizer,
+                        bl,
+                        lr_schedulers,
+                        e,
+                        val_dataset,
+                        problem,
+                        tb_logger,
+                        opts,
+                        ds,
                     )
-                    for _ in range(block):
-                        train_epoch(
-                            model,
-                            optimizer,
-                            baseline1,
-                            lr_schedulers,
-                            epoch,
-                            val_dataset,
-                            problem,
-                            tb_logger,
-                            opts,
-                            train_dataset,
+                    epoch += 1
+            else:
+                # Block 1: dataset 1
+                if train_dataset is not None:
+                    block = min(opts.n_epochs1, total_epochs_remaining(epoch))
+                    if block > 0:
+                        print(
+                            ">> Block on dataset 1: {} epoch(s) starting at epoch {}".format(
+                                block, epoch
+                            )
                         )
-                        epoch += 1
+                        for _ in range(block):
+                            train_epoch(
+                                model,
+                                optimizer,
+                                baseline1,
+                                lr_schedulers,
+                                epoch,
+                                val_dataset,
+                                problem,
+                                tb_logger,
+                                opts,
+                                train_dataset,
+                            )
+                            epoch += 1
 
-            # Block 2: dataset 2
-            if train_dataset2 is not None and epoch < epoch_end:
-                block = min(opts.n_epochs2, total_epochs_remaining(epoch))
-                if block > 0:
-                    print(
-                        ">> Block on dataset 2: {} epoch(s) starting at epoch {}".format(
-                            block, epoch
+                # Block 2: dataset 2
+                if train_dataset2 is not None and epoch < epoch_end:
+                    block = min(opts.n_epochs2, total_epochs_remaining(epoch))
+                    if block > 0:
+                        print(
+                            ">> Block on dataset 2: {} epoch(s) starting at epoch {}".format(
+                                block, epoch
+                            )
                         )
-                    )
-                    for _ in range(block):
-                        train_epoch(
-                            model,
-                            optimizer,
-                            baseline2,
-                            lr_schedulers,
-                            epoch,
-                            val_dataset,
-                            problem,
-                            tb_logger,
-                            opts,
-                            train_dataset2,
-                        )
-                        epoch += 1
+                        for _ in range(block):
+                            train_epoch(
+                                model,
+                                optimizer,
+                                baseline2,
+                                lr_schedulers,
+                                epoch,
+                                val_dataset,
+                                problem,
+                                tb_logger,
+                                opts,
+                                train_dataset2,
+                            )
+                            epoch += 1
 
         end_time = time()
         print("total training duration:", end_time - start_time)
